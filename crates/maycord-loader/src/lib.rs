@@ -193,6 +193,7 @@ mod tests {
                 image: ImageId::MachUuid([0; 16]),
             },
             sites,
+            events: vec![],
         }
     }
 

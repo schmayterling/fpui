@@ -112,6 +112,47 @@ impl PaletteSite {
     }
 }
 
+/// How to read one string argument a detoured function received: the argument
+/// holding the pointer and the one holding its byte length. Argument 0 is the
+/// first (e.g. `x0` on aarch64).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StringArg {
+    pub ptr_arg: u8,
+    pub len_arg: u8,
+}
+
+/// The maycord event a detoured function stands for, and where to read its data
+/// from the call's arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum EventKind {
+    /// The client received a message; `author` and `text` name the string
+    /// arguments the function was called with.
+    MessageReceived { author: StringArg, text: StringArg },
+}
+
+/// A function in the target to detour, so maycord can turn a backend call into an
+/// event for hosted plugins. Pinned to the function's entry by exact bytes, like
+/// a [`PaletteSite`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventSite {
+    /// Image-relative address of the function's entry instruction.
+    pub image_offset: u64,
+    /// The exact bytes expected there; the loader refuses to detour on mismatch.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// Which event this function produces and how to read it.
+    pub event: EventKind,
+}
+
+impl EventSite {
+    /// The runtime address of the function entry given the image's load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
+}
+
 /// The exact identity of one build. If the whole-file SHA-256 matches, the bytes
 /// are identical, so the architecture, image id, and every site's expected bytes
 /// all hold too. The extra fields let the loader give a precise reason and
@@ -178,6 +219,9 @@ pub struct TargetAdapter {
     pub identity: TargetIdentity,
     /// Every color site this adapter knows how to rewrite.
     pub sites: Vec<PaletteSite>,
+    /// Functions to detour into plugin events. Empty for theme-only adapters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<EventSite>,
 }
 
 impl TargetAdapter {
@@ -291,6 +335,7 @@ mod tests {
                 encoding: ColorEncoding::PremultipliedLinearF32,
                 location: ValueLocation::Vector(8),
             }],
+            events: vec![],
         }
     }
 
@@ -342,6 +387,22 @@ mod tests {
         dup.image_offset = 0x999;
         a.sites.push(dup);
         assert_eq!(a.validate(), Err(VerifyError::DuplicateToken("sidebar".into())));
+    }
+
+    #[test]
+    fn an_event_site_round_trips_and_resolves() {
+        let mut a = adapter();
+        a.events = vec![EventSite {
+            image_offset: 0x4000,
+            expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
+            event: EventKind::MessageReceived {
+                author: StringArg { ptr_arg: 0, len_arg: 1 },
+                text: StringArg { ptr_arg: 2, len_arg: 3 },
+            },
+        }];
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
+        assert_eq!(a.events[0].runtime_addr(0x1_0000_0000), 0x1_0000_4000);
     }
 
     #[test]
