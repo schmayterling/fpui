@@ -18,7 +18,7 @@
 //! release binary has no stable Rust layout to rely on, so the loader only ever
 //! touches one checked color slot at a fixed spot.
 
-use maycord_target::{ColorEncoding, TargetAdapter, ValueLocation, VerifyError};
+use maycord_target::{ColorEncoding, EventKind, TargetAdapter, ValueLocation, VerifyError};
 use maycord_theme::{Rgba, Variant};
 
 pub mod agent;
@@ -153,6 +153,89 @@ pub fn plan_writes(adapter: &TargetAdapter, variant: &Variant, image_base: u64) 
 pub fn preflight(exe_bytes: &[u8], adapter: &TargetAdapter) -> Result<(), VerifyError> {
     adapter.validate()?;
     adapter.identity.verify_file(exe_bytes)
+}
+
+/// How one patch (a colour site or an event site) fares against a build: the
+/// label it carries, where it points, and whether its pinned bytes are still
+/// there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchStatus {
+    pub label: String,
+    pub image_offset: u64,
+    pub supported: bool,
+}
+
+/// How a whole adapter fares against one build. This is the heart of running on
+/// any version: rather than demanding the exact pinned build, maycord checks
+/// each patch on its own, so it can apply the ones that still match and report
+/// the ones that have broken.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchReport {
+    /// SHA-256 of the build that was checked.
+    pub sha256: [u8; 32],
+    /// Whether this is the exact build the adapter was pinned to. When it is
+    /// false but patches still match, maycord is running on a *different*
+    /// version that the adapter nonetheless still fits in part.
+    pub identity_matches: bool,
+    pub patches: Vec<PatchStatus>,
+}
+
+impl PatchReport {
+    /// How many patches still verify.
+    pub fn supported(&self) -> usize {
+        self.patches.iter().filter(|p| p.supported).count()
+    }
+
+    /// Whether every patch still verifies.
+    pub fn all_supported(&self) -> bool {
+        self.patches.iter().all(|p| p.supported)
+    }
+
+    /// The patches that no longer verify, i.e. have broken on this build.
+    pub fn broken(&self) -> impl Iterator<Item = &PatchStatus> {
+        self.patches.iter().filter(|p| !p.supported)
+    }
+}
+
+fn bytes_match(build: &[u8], offset: u64, expected: &[u8]) -> bool {
+    let start = offset as usize;
+    build.get(start..start.saturating_add(expected.len())) == Some(expected)
+}
+
+fn event_label(event: &EventKind) -> String {
+    match event {
+        EventKind::MessageReceived { .. } => "message_received".to_string(),
+        _ => "event".to_string(),
+    }
+}
+
+/// Check every patch in `adapter` against a candidate build's bytes, without
+/// running it. This reads the build straight from disk, so it works against any
+/// version: it reports whether this is the exact pinned build and which patches
+/// still match. It is the basis of both the patch monitor and best-effort
+/// application.
+pub fn check_patches(adapter: &TargetAdapter, build: &[u8]) -> PatchReport {
+    let sha256 = maycord_target::sha256(build);
+    let mut patches = Vec::with_capacity(adapter.sites.len() + adapter.events.len());
+    for site in &adapter.sites {
+        patches.push(PatchStatus {
+            label: site.token.clone(),
+            image_offset: site.image_offset,
+            supported: bytes_match(build, site.image_offset, &site.expected_bytes),
+        });
+    }
+    for event in &adapter.events {
+        patches.push(PatchStatus {
+            label: event_label(&event.event),
+            image_offset: event.image_offset,
+            supported: bytes_match(build, event.image_offset, &event.expected_bytes),
+        });
+    }
+    PatchReport {
+        identity_matches: sha256 == adapter.identity.sha256,
+        sha256,
+        patches,
+    }
 }
 
 /// macOS launch: check the target on disk, then start it with the agent dylib
@@ -331,5 +414,28 @@ mod tests {
         // right bytes.
         let adapter = adapter_with(vec![], b"right");
         assert_eq!(preflight(b"right", &adapter), Err(VerifyError::NoSites));
+    }
+
+    #[test]
+    fn check_patches_reports_each_patch_and_version_fit() {
+        // A build with the site's pinned bytes at offset 8.
+        let mut build = vec![0u8; 64];
+        build[8..12].copy_from_slice(&[0x1f, 0x20, 0x03, 0xd5]);
+        let adapter = adapter_with(vec![site("sidebar", 8, ColorEncoding::SrgbU32)], &build);
+
+        // Exact build: it is the pinned version and the patch verifies.
+        let report = check_patches(&adapter, &build);
+        assert!(report.identity_matches);
+        assert!(report.all_supported());
+        assert_eq!(report.supported(), 1);
+
+        // A different build where that spot changed: no longer the pinned
+        // version, and the patch is reported broken rather than applied.
+        let mut other = build.clone();
+        other[8] ^= 0x01;
+        let report = check_patches(&adapter, &other);
+        assert!(!report.identity_matches);
+        assert!(!report.all_supported());
+        assert_eq!(report.broken().next().unwrap().label, "sidebar");
     }
 }

@@ -148,6 +148,31 @@ pub fn verify_sites(plan: &[PlannedWrite]) -> Result<(), SiteMismatch> {
     Ok(())
 }
 
+/// Split a plan into the sites that still hold their pinned bytes (safe to
+/// write) and the ones a newer build has moved. This is what lets the agent run
+/// on any version: it patches every site that still matches and reports the rest
+/// instead of refusing to do anything when one site has drifted.
+pub fn partition_live(plan: &[PlannedWrite]) -> (Vec<PlannedWrite>, Vec<SiteMismatch>) {
+    let mut live = Vec::new();
+    let mut stale = Vec::new();
+    for write in plan {
+        // SAFETY: identical to `verify_sites` — a read-only compare of exactly
+        // `expected_bytes.len()` bytes at an identity-checked image offset.
+        let actual = unsafe {
+            std::slice::from_raw_parts(write.runtime_addr as *const u8, write.expected_bytes.len())
+        };
+        if actual == write.expected_bytes.as_slice() {
+            live.push(write.clone());
+        } else {
+            stale.push(SiteMismatch {
+                token: write.token.clone(),
+                addr: write.runtime_addr,
+            });
+        }
+    }
+    (live, stale)
+}
+
 /// Make the color writes: the one step that changes the target's running code.
 ///
 /// With the `frida` feature (and on macOS), this attaches a frida-gum probe at
@@ -311,20 +336,17 @@ mod frida_backend {
             let actual =
                 unsafe { std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len()) };
             if actual != site.expected_bytes.as_slice() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("event site at {addr:#x} does not hold its pinned bytes"),
-                ));
+                // Same version-resilience as the color sites: a moved event hook
+                // is skipped and reported, not treated as a fatal error.
+                eprintln!("maycord: skipping event site at {addr:#x}; pinned bytes moved");
+                continue;
             }
-            match site.event {
-                EventKind::MessageReceived { author, text } => {
-                    let probe = Box::leak(Box::new(MessageProbe { author, text, tx: tx.clone() }));
-                    let np = NativePointer(addr as *mut core::ffi::c_void);
-                    interceptor.attach_instruction(np, probe).map_err(|e| {
-                        io::Error::other(format!("attach event at {addr:#x}: {e:?}"))
-                    })?;
-                }
-                _ => {}
+            if let EventKind::MessageReceived { author, text } = site.event {
+                let probe = Box::leak(Box::new(MessageProbe { author, text, tx: tx.clone() }));
+                let np = NativePointer(addr as *mut core::ffi::c_void);
+                interceptor.attach_instruction(np, probe).map_err(|e| {
+                    io::Error::other(format!("attach event at {addr:#x}: {e:?}"))
+                })?;
             }
         }
         Box::leak(Box::new((gum, interceptor)));
@@ -408,15 +430,23 @@ pub fn run() -> io::Result<()> {
     let base = main_image_base()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "main executable image not found"))?;
     let plan = plan_writes(&adapter, variant, base);
-    verify_sites(&plan).map_err(invalid)?;
+    // Run on any version: check each site live, patch the ones that still match,
+    // and report the ones a newer build has moved. A single drifted site no
+    // longer blocks the patches that do still apply.
+    let (live, stale) = partition_live(&plan);
+    for miss in &stale {
+        eprintln!("maycord: skipping {miss}");
+    }
     // A build without the write backend (e.g. no `frida`) still injects and
     // verifies; it just can't apply. Report that and carry on to plugin hosting
     // rather than aborting.
-    if let Err(e) = apply(&plan) {
-        if e.kind() == io::ErrorKind::Unsupported {
-            eprintln!("maycord: {e}");
-        } else {
-            return Err(e);
+    if !live.is_empty() {
+        if let Err(e) = apply(&live) {
+            if e.kind() == io::ErrorKind::Unsupported {
+                eprintln!("maycord: {e}");
+            } else {
+                return Err(e);
+            }
         }
     }
 
@@ -468,6 +498,21 @@ mod tests {
         mismatch.expected_bytes = vec![0, 0, 0, 0];
         let err = verify_sites(std::slice::from_ref(&mismatch)).unwrap_err();
         assert_eq!(err.token, "sidebar");
+    }
+
+    #[test]
+    fn partition_live_keeps_matching_sites_and_reports_moved_ones() {
+        // One site points at live bytes that match; the other expects bytes that
+        // aren't there. Only the first is safe to patch on this build.
+        let buffer = [0xde_u8, 0xad, 0xbe, 0xef];
+        let matches = write_at(&buffer);
+        let mut moved = matches.clone();
+        moved.expected_bytes = vec![0, 0, 0, 0];
+
+        let (live, stale) = partition_live(&[matches, moved]);
+        assert_eq!(live.len(), 1);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].token, "sidebar");
     }
 
     #[test]
