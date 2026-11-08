@@ -118,8 +118,15 @@ fn print_text(report: &PatchReport, label: Option<&str>) {
     println!();
     for p in &report.patches {
         let tag = if p.supported { " ok  " } else { "BROKEN" };
-        let note = if p.supported { "" } else { "   <- no longer matches" };
-        println!("  [{tag}]  {:<20} @ {:#010x}{note}", p.label, p.image_offset);
+        let shown = p.resolved_offset.unwrap_or(p.image_offset);
+        let note = if !p.supported {
+            "   <- no longer matches".to_string()
+        } else if p.drift() != 0 {
+            format!("   (moved {:+} from {:#010x})", p.drift(), p.image_offset)
+        } else {
+            String::new()
+        };
+        println!("  [{tag}]  {:<20} @ {shown:#010x}{note}", p.label);
     }
     println!();
     let broken = report.patches.len() - report.supported();
@@ -135,9 +142,10 @@ fn print_json(report: &PatchReport, label: Option<&str>) {
         .patches
         .iter()
         .map(|p| {
+            let resolved = p.resolved_offset.map_or_else(|| "null".to_string(), |o| o.to_string());
             format!(
-                r#"{{"label":{:?},"offset":{},"supported":{}}}"#,
-                p.label, p.image_offset, p.supported
+                r#"{{"label":{:?},"offset":{},"resolved_offset":{},"drift":{},"supported":{}}}"#,
+                p.label, p.image_offset, resolved, p.drift(), p.supported
             )
         })
         .collect();
