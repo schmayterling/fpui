@@ -423,6 +423,42 @@ pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter,
             }
         }
     });
+
+    // Signature-based drift recovery for the detour/append/patch families, so a
+    // moved `after`/`before`/`instead`/append/byte-patch relocates instead of
+    // silently failing the live check — the "runs on any version" gap for every
+    // family but colour. These differ from the colour/event passes above: a site
+    // here is only touched when it carries a `signature` to re-resolve against;
+    // without one it is left for `attach_*`/`apply_byte_patches` to verify live
+    // (an un-anchored, un-signed site has no resolve-time evidence to act on, so
+    // the live byte check stays its final gate). Anchored sites in these families
+    // are already re-resolved above by `resolve_anchored_entries`. The label
+    // field differs (`token`), so the macro names it.
+    macro_rules! recover_signed {
+        ($family:expr, $label:ident) => {
+            $family.retain_mut(|s| {
+                if s.signature.is_none() {
+                    return true;
+                }
+                match locate(image, s.image_offset, &s.expected_bytes, s.signature.as_ref()) {
+                    Located::At(off) => {
+                        s.image_offset = off;
+                        true
+                    }
+                    Located::Missing => {
+                        dropped.push(s.$label.clone());
+                        false
+                    }
+                }
+            });
+        };
+    }
+    recover_signed!(resolved.returns, token);
+    recover_signed!(resolved.args, token);
+    recover_signed!(resolved.replaces, token);
+    recover_signed!(resolved.appends, token);
+    recover_signed!(resolved.patches, token);
+
     (resolved, dropped)
 }
 
@@ -443,6 +479,7 @@ fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped:
         .chain(resolved.returns.iter().filter_map(|r| r.anchor.as_ref()))
         .chain(resolved.args.iter().filter_map(|a| a.anchor.as_ref()))
         .chain(resolved.replaces.iter().filter_map(|p| p.anchor.as_ref()))
+        .chain(resolved.appends.iter().filter_map(|a| a.anchor.as_ref()))
         .map(|a| a.text.as_str())
         .collect();
     if texts.is_empty() {
@@ -509,6 +546,21 @@ fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped:
             }
             _ => {
                 dropped.push(p.token.clone());
+                false
+            }
+        }
+    });
+    resolved.appends.retain_mut(|a| {
+        if a.anchor.is_none() {
+            return true;
+        }
+        match anchors.next() {
+            Some(Ok(hit)) => {
+                a.image_offset = hit.func_offset;
+                true
+            }
+            _ => {
+                dropped.push(a.token.clone());
                 false
             }
         }
@@ -645,7 +697,9 @@ pub fn launch_linux(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fpui_target::{Arch, BytePatchSite, ImageId, PaletteSite, TargetIdentity};
+    use fpui_target::{
+        Arch, BytePatchSite, ImageId, PaletteSite, ReturnOp, ReturnSite, TargetIdentity,
+    };
 
     fn adapter_with(sites: Vec<PaletteSite>, exe: &[u8]) -> TargetAdapter {
         TargetAdapter {
@@ -962,5 +1016,41 @@ mod tests {
         assert_eq!(resolved.sites[0].token, "sidebar");
         assert_eq!(resolved.sites[0].image_offset, 60); // recovered from 8
         assert_eq!(dropped, vec!["background".to_string()]);
+    }
+
+    #[test]
+    fn resolve_adapter_recovers_a_signed_detour_and_leaves_the_unsigned_alone() {
+        // #8: a non-colour family (here a `return`) now re-resolves by signature.
+        // The first return's hint is wrong but its signature recovers it; the
+        // second has no signature, so resolve_adapter must leave it untouched for
+        // the live byte check rather than drop it.
+        let mut build = vec![0u8; 128];
+        build[60..64].copy_from_slice(EXPECT);
+        let mut adapter = adapter_with(vec![], &build);
+        adapter.returns = vec![
+            ReturnSite {
+                token: "after".into(),
+                image_offset: 8, // wrong; the signature recovers it to 60
+                expected_bytes: EXPECT.to_vec(),
+                op: ReturnOp::InvertBool,
+                signature: Some(Signature { bytes: EXPECT.to_vec(), site_offset: 0 }),
+                anchor: None,
+            },
+            ReturnSite {
+                token: "unsigned".into(),
+                image_offset: 999, // bogus, but no signature -> deferred, not dropped
+                expected_bytes: EXPECT.to_vec(),
+                op: ReturnOp::InvertBool,
+                signature: None,
+                anchor: None,
+            },
+        ];
+
+        let (resolved, dropped) = resolve_adapter(&adapter, &build);
+
+        assert!(dropped.is_empty(), "the un-signed return defers to the live check");
+        assert_eq!(resolved.returns.len(), 2);
+        assert_eq!(resolved.returns[0].image_offset, 60, "signature recovered the drift");
+        assert_eq!(resolved.returns[1].image_offset, 999, "un-signed left untouched");
     }
 }
