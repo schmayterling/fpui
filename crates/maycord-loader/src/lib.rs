@@ -273,7 +273,9 @@ fn locate(image: &[u8], hint: u64, expected: &[u8], signature: Option<&Signature
     }
 }
 
-/// Count how many times `needle` occurs in `haystack`.
+/// Count how many times `needle` occurs in `haystack`. Used by tests to assert
+/// exact multiplicity; the fast path uses [`occurs_once`].
+#[cfg(test)]
 fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() {
         return 0;
@@ -285,6 +287,17 @@ fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
         from = at + 1;
     }
     count
+}
+
+/// Whether `needle` occurs exactly once in `haystack`. Stops at the second hit,
+/// so a common window (thousands of hits early in the search) is rejected after
+/// two scans instead of counting them all. This is what keeps signature
+/// extraction fast on a large binary.
+fn occurs_once(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some(first) = find_from(haystack, needle, 0) else {
+        return false;
+    };
+    find_from(haystack, needle, first + 1).is_none()
 }
 
 /// Build the shortest byte window around a site that occurs exactly once in
@@ -329,7 +342,7 @@ pub fn extract_signature_across(
         let start = site.saturating_sub(radius);
         let end = site_end.saturating_add(radius).min(first.len());
         let window = &first[start..end];
-        if images.iter().all(|image| occurrences(image, window) == 1) {
+        if images.iter().all(|image| occurs_once(image, window)) {
             return Some(Signature {
                 bytes: window.to_vec(),
                 site_offset: (site - start) as u64,
