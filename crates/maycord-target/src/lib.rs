@@ -104,6 +104,19 @@ pub struct Signature {
     pub site_offset: u64,
 }
 
+/// A stable string a target function references, used to re-find that function's
+/// entry after a recompile has moved it. Where a [`Signature`] pins a site by the
+/// bytes immediately around it, an anchor pins a function by a string in its body:
+/// the loader resolves the string's one reference back to the enclosing function
+/// at load time and rewrites the drifted `image_offset`. Only sites pinned to a
+/// function entry (events, returns, args) carry one; the string must occur once
+/// and be referenced from a single function, or the loader refuses to guess.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StringAnchor {
+    /// The exact string the target function references.
+    pub text: String,
+}
+
 /// One spot in a specific build where a color is built, plus everything the
 /// loader needs to check that spot and rewrite that one color.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,6 +185,11 @@ pub struct EventSite {
     /// absent, the entry is pinned only to its exact `image_offset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    /// Optional string anchor to re-find this function's entry when the build has
+    /// drifted. When present, the loader resolves it at load time and overwrites
+    /// `image_offset` with the recovered entry before the byte check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StringAnchor>,
 }
 
 impl EventSite {
@@ -228,6 +246,11 @@ pub struct ReturnSite {
     /// absent, the entry is pinned only to its exact `image_offset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    /// Optional string anchor to re-find this function's entry when the build has
+    /// drifted. When present, the loader resolves it at load time and overwrites
+    /// `image_offset` with the recovered entry before the byte check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StringAnchor>,
 }
 
 impl ReturnSite {
@@ -281,6 +304,11 @@ pub struct ArgSite {
     /// absent, the entry is pinned only to its exact `image_offset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Signature>,
+    /// Optional string anchor to re-find this function's entry when the build has
+    /// drifted. When present, the loader resolves it at load time and overwrites
+    /// `image_offset` with the recovered entry before the byte check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StringAnchor>,
 }
 
 impl ArgSite {
@@ -611,6 +639,7 @@ mod tests {
                 text: StringArg { ptr_arg: 2, len_arg: 3 },
             },
             signature: None,
+            anchor: None,
         }];
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
@@ -627,6 +656,7 @@ mod tests {
                 expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
                 op: ReturnOp::InvertBool,
                 signature: None,
+                anchor: None,
             },
             ReturnSite {
                 token: "premium".into(),
@@ -634,6 +664,7 @@ mod tests {
                 expected_bytes: vec![0x1f, 0x20, 0x03, 0xd5],
                 op: ReturnOp::Force { value: 1 },
                 signature: None,
+                anchor: None,
             },
         ];
         let json = serde_json::to_string(&a).unwrap();
@@ -656,6 +687,7 @@ mod tests {
             arg: 2,
             op: ArgOp::Force { value: 0 },
             signature: None,
+            anchor: None,
         }];
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);

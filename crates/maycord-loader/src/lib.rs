@@ -396,9 +396,15 @@ fn event_label(event: &EventKind) -> String {
 /// are dropped, so planning only ever sees patches that are really present in
 /// this build, and the dropped labels are returned for reporting. This is what
 /// lets the agent apply a drifted adapter instead of just detecting the drift.
+///
+/// Anchored function entries (events, returns, args) are re-found first: a string
+/// anchor re-resolves the entry from scratch in this build, surviving a recompile
+/// that moved it past what a byte signature could recover. The pinned bytes stay
+/// the final gate — an anchored event still passes through the byte check below.
 pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter, Vec<String>) {
     let mut resolved = adapter.clone();
     let mut dropped = Vec::new();
+    resolve_anchored_entries(&mut resolved, image, &mut dropped);
     resolved.sites.retain_mut(|s| {
         match locate(image, s.image_offset, &s.expected_bytes, s.signature.as_ref()) {
             Located::At(off) => {
@@ -424,6 +430,79 @@ pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter,
         }
     });
     (resolved, dropped)
+}
+
+/// Re-find every anchored function entry in `image` and overwrite its
+/// `image_offset` with the recovered entry, dropping any site whose anchor can't
+/// be resolved. Every anchor across events, returns and args is resolved in one
+/// batched pass — the `__text` scan is the costly part, so resolving per site
+/// would reparse the image N times. Any failure, whole-image or a single string
+/// (missing, ambiguous, unreferenced), drops that site; the pinned bytes remain
+/// the final gate downstream. Sites without an anchor are left untouched.
+fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped: &mut Vec<String>) {
+    // The anchor text of every event/return/arg site that has one, in that order
+    // — the same order the retains below consume the results in.
+    let texts: Vec<&str> = resolved
+        .events
+        .iter()
+        .filter_map(|e| e.anchor.as_ref())
+        .chain(resolved.returns.iter().filter_map(|r| r.anchor.as_ref()))
+        .chain(resolved.args.iter().filter_map(|a| a.anchor.as_ref()))
+        .map(|a| a.text.as_str())
+        .collect();
+    if texts.is_empty() {
+        return;
+    }
+    // One pass resolves them all. An outer `Err` (unparseable image) fails every
+    // anchor exactly as a per-string `Err` does: the empty vec yields `None`
+    // below, so each anchored site is dropped — all errors treated the same.
+    let anchors = anchor::resolve_anchors(image, &texts).unwrap_or_default();
+    let mut anchors = anchors.into_iter();
+    resolved.events.retain_mut(|e| {
+        if e.anchor.is_none() {
+            return true;
+        }
+        match anchors.next() {
+            Some(Ok(hit)) => {
+                e.image_offset = hit.func_offset;
+                true
+            }
+            _ => {
+                dropped.push(event_label(&e.event));
+                false
+            }
+        }
+    });
+    resolved.returns.retain_mut(|r| {
+        if r.anchor.is_none() {
+            return true;
+        }
+        match anchors.next() {
+            Some(Ok(hit)) => {
+                r.image_offset = hit.func_offset;
+                true
+            }
+            _ => {
+                dropped.push(r.token.clone());
+                false
+            }
+        }
+    });
+    resolved.args.retain_mut(|a| {
+        if a.anchor.is_none() {
+            return true;
+        }
+        match anchors.next() {
+            Some(Ok(hit)) => {
+                a.image_offset = hit.func_offset;
+                true
+            }
+            _ => {
+                dropped.push(a.token.clone());
+                false
+            }
+        }
+    });
 }
 
 fn status(label: String, hint: u64, located: Located) -> PatchStatus {

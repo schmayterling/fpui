@@ -788,6 +788,7 @@ dependencies = [
  "maycord-target",
  "maycord-theme",
  "maycord-wasm",
+ "object",
  "serde",
  "serde_json",
  "wat",
