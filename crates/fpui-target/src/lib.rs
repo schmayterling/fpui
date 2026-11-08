@@ -563,13 +563,28 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
-        return Err(format!("hex string has odd length {}", s.len()));
+    // Decode over bytes, never string slices: a hex field is attacker-controlled
+    // JSON, and `&s[i..i + 2]` panics on a multibyte UTF-8 char at an odd
+    // boundary (e.g. "€0" is even-length in bytes). A non-ASCII byte is an
+    // error, not a crash.
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(format!("hex string has odd length {}", bytes.len()));
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+    bytes
+        .chunks_exact(2)
+        .map(|pair| Ok((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
         .collect()
+}
+
+/// One ASCII hex digit (`0-9a-fA-F`) to its value, or an error for anything else.
+fn hex_digit(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        other => Err(format!("invalid hex digit {:?}", other as char)),
+    }
 }
 
 /// Serialize `Vec<u8>` as a hex string instead of a JSON array of numbers, so an
@@ -778,6 +793,14 @@ mod tests {
         only.sites.clear();
         only.replaces = a.replaces.clone();
         assert!(only.validate().is_ok());
+    }
+
+    #[test]
+    fn unhex_rejects_non_ascii_without_panicking() {
+        // "€0" is even-length in BYTES; the old string-slice decoder panicked here.
+        assert!(unhex("€0").is_err());
+        assert!(unhex("zz").is_err());
+        assert_eq!(unhex("1f2003d5").unwrap(), vec![0x1f, 0x20, 0x03, 0xd5]);
     }
 
     #[test]
