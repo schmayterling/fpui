@@ -289,7 +289,9 @@ pub struct TargetAdapter {
     pub name: String,
     /// The exact build this adapter is pinned to.
     pub identity: TargetIdentity,
-    /// Every color site this adapter knows how to rewrite.
+    /// Every color site this adapter knows how to rewrite. Empty for an adapter
+    /// that only patches bytes or detours events.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sites: Vec<PaletteSite>,
     /// Functions to detour into plugin events. Empty for theme-only adapters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
