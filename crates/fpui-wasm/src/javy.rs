@@ -17,13 +17,25 @@
 //! own [`Store`] — its own linear memory, fuel, and stdin/stdout — so plugins
 //! and successive calls never share state.
 //!
+//! ## Static vs dynamic linking
+//! [`JavyPlugin`] runs a **static** module: the QuickJS engine (~1.3 MiB) is
+//! embedded in every plugin. [`JavyRuntime`] runs **dynamic** modules instead:
+//! the engine is compiled *once* as a shared plugin module (`javy emit-plugin`)
+//! and each JS plugin is a tiny 1-16 KiB module (`javy build -C dynamic`) that
+//! imports the shared engine's `memory`, `cabi_realloc`, and `invoke`. N plugins
+//! then cost ~1.3 MiB + N×(KBs) of wasm instead of N×1.3 MiB. Isolation is
+//! unchanged — a *fresh* engine instance is built per call, sharing only the
+//! compiled module, so no QuickJS state leaks between calls or plugins.
+//!
 //! ## The shim — two pipes and nothing else
-//! Javy imports nine `wasi_snapshot_preview1` functions. This module provides
-//! all nine, backed only by two in-memory buffers: stdin (fd 0, read-only, the
-//! payload) and stdout (fd 1, write-only, the result). fd 2 (stderr) is
-//! discarded; every other descriptor and every other capability — no files, no
-//! sockets, no clock beyond a zero reading, no environment — is denied. The
-//! guest has zero ambient authority beyond those two pipes, by construction.
+//! A Javy module imports a handful of `wasi_snapshot_preview1` functions (nine
+//! for a static module; a dynamic plugin also wants `random_get`). This module
+//! provides all ten, backed only by two in-memory buffers: stdin (fd 0,
+//! read-only, the payload) and stdout (fd 1, write-only, the result). fd 2
+//! (stderr) is discarded; `random_get` is zero-filled; every other descriptor
+//! and every other capability — no files, no sockets, no clock beyond a zero
+//! reading, no environment, no real entropy — is denied. The guest has zero
+//! ambient authority beyond those two pipes, by construction.
 //!
 //! ## The stdin frame — hook name + payload
 //! stdin is **framed** so the JS receives both the hook name and the payload,
@@ -44,10 +56,12 @@
 //! * [`Plugin::observe`] now runs the module (fuel-bounded, trap-safe) and
 //!   discards stdout, but with no host imports yet a JS observer still cannot
 //!   *do* anything — it waits on the capability host-import work.
-//! * Each static Javy module embeds its own ~1.3 MiB QuickJS engine. Dynamic
-//!   linking (one shared provider + KB-scale per-plugin modules) is the
-//!   footprint win and the next step; this shim targets the static module's
-//!   nine-import surface.
+//! * No capability host-imports yet: a JS plugin has zero ambient authority, so
+//!   `observe` runs but cannot act, and a transform is a pure function of its
+//!   framed input. Wiring the first host import (e.g. storage) into JS globals
+//!   through the import chokepoint is the next step.
+
+use std::sync::Arc;
 
 use fpui_host::Plugin;
 use wasmi::{Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder};
@@ -180,6 +194,131 @@ impl Plugin for JavyPlugin {
     }
 }
 
+/// The shared QuickJS engine for dynamically-linked plugins: the ~1.3 MiB Javy
+/// plugin module (`javy emit-plugin`), compiled once and reused to run many tiny
+/// dynamic plugin modules. A dynamic module is 1-16 KiB and imports this engine's
+/// `memory`, `cabi_realloc`, and `invoke`, so the engine is stored once instead
+/// of embedded in every plugin: N JS plugins cost ~1.3 MiB + N×(KBs) of wasm
+/// rather than N×1.3 MiB.
+///
+/// Isolation is preserved. Only the *compiled* engine module is shared; a fresh
+/// instance is built per call, so no QuickJS state leaks between calls or between
+/// plugins. The win is module footprint, never a shared live instance.
+struct SharedEngine {
+    engine: Engine,
+    /// The shared QuickJS plugin module.
+    plugin: Module,
+    /// The WASI shim, reusable across every call's [`Store`].
+    wasi: Linker<JavyCtx>,
+}
+
+/// A runtime hosting one shared QuickJS engine for dynamically-linked plugins.
+/// Load the engine once, then [`JavyRuntime::load`] any number of tiny modules.
+pub struct JavyRuntime {
+    shared: Arc<SharedEngine>,
+    fuel_per_call: u64,
+}
+
+impl JavyRuntime {
+    /// Build a runtime around the shared plugin module emitted by
+    /// `javy emit-plugin`, with the [`JAVY_DEFAULT_FUEL`] per-call budget.
+    pub fn new(plugin_wasm: &[u8]) -> Result<Self, WasmError> {
+        Self::new_with_fuel(plugin_wasm, JAVY_DEFAULT_FUEL)
+    }
+
+    /// Build a runtime with an explicit per-call fuel budget.
+    pub fn new_with_fuel(plugin_wasm: &[u8], fuel_per_call: u64) -> Result<Self, WasmError> {
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        config.wasm_simd(true).wasm_relaxed_simd(true);
+        let engine = Engine::new(&config);
+        let plugin = Module::new(&engine, plugin_wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
+        let mut wasi = Linker::new(&engine);
+        define_wasi(&mut wasi).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+        Ok(Self { shared: Arc::new(SharedEngine { engine, plugin, wasi }), fuel_per_call })
+    }
+
+    /// Compile a dynamically-linked plugin module (`javy build -C dynamic`)
+    /// against this runtime's shared engine.
+    pub fn load(&self, module_wasm: &[u8]) -> Result<DynamicJavyPlugin, WasmError> {
+        let module = Module::new(&self.shared.engine, module_wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
+        // The module's imports all name the shared plugin; capture that namespace
+        // from the module itself so the exact string (e.g. the versioned
+        // "javy-default-plugin-v4") is never hard-coded here.
+        let plugin_ns = module
+            .imports()
+            .next()
+            .ok_or(WasmError::MissingExport("plugin import"))?
+            .module()
+            .to_string();
+        Ok(DynamicJavyPlugin { shared: Arc::clone(&self.shared), module, plugin_ns, fuel_per_call: self.fuel_per_call })
+    }
+}
+
+/// One dynamically-linked JS plugin: a tiny module that runs on a shared
+/// [`JavyRuntime`] engine. A [`Plugin`] exactly like [`JavyPlugin`], but without
+/// the embedded engine.
+pub struct DynamicJavyPlugin {
+    shared: Arc<SharedEngine>,
+    module: Module,
+    /// The import namespace the dynamic module expects the shared engine under.
+    plugin_ns: String,
+    fuel_per_call: u64,
+}
+
+impl DynamicJavyPlugin {
+    /// Run the tiny module once for `hook` over `payload`: a fresh engine
+    /// instance is initialized, the module is linked to it, and its `_start`
+    /// runs. Same `None`-keeps-the-original contract as [`JavyPlugin::run`].
+    fn run(&self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        let mut store = Store::new(&self.shared.engine, JavyCtx::new(&frame(hook, payload)));
+        store.limiter(|ctx| &mut ctx.limits);
+        // One budget covers engine init, linking, and the `_start` run.
+        store.set_fuel(self.fuel_per_call).ok()?;
+
+        // A fresh engine instance for this call, so no QuickJS state carries over.
+        // The shared plugin from `javy emit-plugin` is already pre-initialized, so
+        // the host does NOT call `initialize-runtime` — that is the plugin's
+        // Wizer pre-init entry, and invoking it on an initialized runtime panics.
+        let plugin = self.shared.wasi.instantiate_and_start(&mut store, &self.shared.plugin).ok()?;
+
+        // Wire the tiny module's three imports to this engine instance's exports.
+        let memory = plugin.get_memory(&store, "memory")?;
+        let cabi_realloc = plugin.get_func(&store, "cabi_realloc")?;
+        let invoke = plugin.get_func(&store, "invoke")?;
+        let mut linker = Linker::new(&self.shared.engine);
+        linker.define(&self.plugin_ns, "memory", memory).ok()?;
+        linker.define(&self.plugin_ns, "cabi_realloc", cabi_realloc).ok()?;
+        linker.define(&self.plugin_ns, "invoke", invoke).ok()?;
+
+        let instance = linker.instantiate_and_start(&mut store, &self.module).ok()?;
+        let start = instance.get_typed_func::<(), ()>(&store, "_start").ok()?;
+        match start.call(&mut store, ()) {
+            Ok(()) => {}
+            Err(e) => match e.i32_exit_status() {
+                Some(0) => {}
+                _ => return None,
+            },
+        }
+
+        let ctx = store.data_mut();
+        if ctx.output_overflow || ctx.stdout.len() > MAX_OUTPUT || ctx.stdout.is_empty() {
+            return None;
+        }
+        Some(core::mem::take(&mut ctx.stdout))
+    }
+}
+
+impl Plugin for DynamicJavyPlugin {
+    fn transform(&mut self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        self.run(hook, payload)
+    }
+
+    fn observe(&mut self, hook: &str, payload: &[u8]) {
+        let _ = self.run(hook, payload);
+    }
+}
+
 /// Frame the host→guest stdin: a little-endian `u32` hook length, the hook name
 /// (UTF-8), then the opaque payload. The length prefix keeps the payload raw
 /// (JSON would force arbitrary bytes through base64). The guest parses this to
@@ -219,7 +358,7 @@ fn guest_memory(caller: &Caller<JavyCtx>) -> Option<Memory> {
     caller.get_export("memory").and_then(Extern::into_memory)
 }
 
-/// Define the nine `wasi_snapshot_preview1` imports a Javy module needs, backed
+/// Define the ten `wasi_snapshot_preview1` imports a Javy module needs, backed
 /// only by the in-memory stdin/stdout pipes. Everything outside those two pipes
 /// is denied, so the guest has no ambient authority to reach a real resource.
 fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
@@ -373,6 +512,27 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
             let (data, _ctx) = mem.data_and_store_mut(&mut caller);
             match write_u64(data, time as usize, 0) {
                 Some(()) => Ok(ERRNO_SUCCESS),
+                None => Ok(ERRNO_BADF),
+            }
+        },
+    )?;
+
+    // random_get(buf, len): a dynamic plugin seeds its RNG here. There is no
+    // ambient entropy to give — zero-fill the buffer. Deterministic and
+    // authority-free, matching the zero clock; it only makes `Math.random()`
+    // non-secure, which is harmless in a transform sandbox that holds no secrets.
+    linker.func_wrap(
+        WASI,
+        "random_get",
+        |mut caller: Caller<JavyCtx>, buf: i32, len: i32| -> Result<i32, Error> {
+            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let (data, _ctx) = mem.data_and_store_mut(&mut caller);
+            let (start, end) = (buf as usize, (buf as usize).saturating_add(len as usize));
+            match data.get_mut(start..end) {
+                Some(slot) => {
+                    slot.fill(0);
+                    Ok(ERRNO_SUCCESS)
+                }
                 None => Ok(ERRNO_BADF),
             }
         },
@@ -592,5 +752,79 @@ mod tests {
         host.register(&manifest, std::slice::from_ref(&cap), Box::new(plugin)).unwrap();
         let out = host.transform(&cap, "message", b"through the host");
         assert_eq!(out, b"THROUGH THE HOST");
+    }
+
+    // A javy-free stand-in for the shared QuickJS plugin: it exports `memory`,
+    // `cabi_realloc`, and `invoke` — the exact surface a real `javy emit-plugin`
+    // module exposes to a dynamic module — and imports only the shim's stdio.
+    // `invoke` echoes the framed stdin to stdout on this (shared) memory, standing
+    // in for "run the embedded JS".
+    const FAKE_PLUGIN_WAT: &str = r#"
+    (module
+      (import "wasi_snapshot_preview1" "fd_read"
+        (func $fd_read (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write"
+        (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (global $heap (mut i32) (i32.const 2048))
+      (func (export "cabi_realloc")
+        (param $ptr i32) (param $old i32) (param $align i32) (param $new i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $heap))
+        (global.set $heap (i32.add (global.get $heap) (local.get $new)))
+        (local.get $p))
+      ;; invoke(a,b,c,d,e): read stdin into [64..], write it back to stdout.
+      (func (export "invoke") (param i32 i32 i32 i32 i32)
+        (local $n i32)
+        (i32.store (i32.const 0) (i32.const 64))
+        (i32.store (i32.const 4) (i32.const 4096))
+        (drop (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+        (local.set $n (i32.load (i32.const 8)))
+        (i32.store (i32.const 16) (i32.const 64))
+        (i32.store (i32.const 20) (local.get $n))
+        (drop (call $fd_write (i32.const 1) (i32.const 16) (i32.const 1) (i32.const 24)))))
+    "#;
+
+    // A javy-free stand-in for a dynamically-linked module: it declares no memory
+    // of its own, imports the shared plugin's `memory`/`cabi_realloc`/`invoke`
+    // under a NON-default namespace (so the host can't be hard-coding the real
+    // "javy-default-plugin-v4"), and its `_start` just drives `invoke`.
+    const FAKE_DYN_MODULE_WAT: &str = r#"
+    (module
+      (import "fpui-test-plugin" "memory" (memory 0))
+      (import "fpui-test-plugin" "cabi_realloc"
+        (func $realloc (param i32 i32 i32 i32) (result i32)))
+      (import "fpui-test-plugin" "invoke"
+        (func $invoke (param i32 i32 i32 i32 i32)))
+      (func (export "_start")
+        (call $invoke (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))))
+    "#;
+
+    #[test]
+    fn a_dynamic_module_runs_on_the_shared_engine() {
+        let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
+        let mut js = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        // The tiny module shares the plugin's memory and calls its `invoke`, which
+        // echoes the framed stdin — so the host gets the whole frame back. Proves
+        // the shared-engine hosting chain: instantiate the plugin, wire its memory
+        // and funcs into the module, run `_start`, read stdout.
+        let out = js.transform("message", b"dyn hi").unwrap();
+        assert_eq!(out, frame("message", b"dyn hi"));
+    }
+
+    #[test]
+    fn the_runtime_hosts_many_modules_from_one_shared_plugin() {
+        // The footprint win: one compiled plugin, many tiny modules.
+        let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
+        let mut a = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        let mut b = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        assert_eq!(a.transform("x", b"one").unwrap(), frame("x", b"one"));
+        assert_eq!(b.transform("y", b"two").unwrap(), frame("y", b"two"));
+    }
+
+    #[test]
+    fn the_runtime_rejects_a_non_module() {
+        let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
+        assert!(matches!(runtime.load(b"not wasm"), Err(WasmError::Compile(_))));
     }
 }

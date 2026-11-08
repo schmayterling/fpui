@@ -25,5 +25,10 @@ wat = "1.263.0"
 name = "run_js"
 required-features = ["js"]
 
+# Runs a dynamically-linked Javy JS plugin on a shared engine; needs `js`.
+[[example]]
+name = "run_js_dyn"
+required-features = ["js"]
+
 [lints]
 workspace = true

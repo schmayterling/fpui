@@ -52,7 +52,7 @@ use wasmi::{Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLim
 #[cfg(feature = "js")]
 mod javy;
 #[cfg(feature = "js")]
-pub use javy::JavyPlugin;
+pub use javy::{DynamicJavyPlugin, JavyPlugin, JavyRuntime};
 
 /// Fuel spent per hook call before the guest is trapped. Generous for a text
 /// transform, small enough that a runaway loop dies in milliseconds.
