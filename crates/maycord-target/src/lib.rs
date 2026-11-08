@@ -181,6 +181,43 @@ impl EventSite {
     }
 }
 
+/// A spot to overwrite with new bytes of the same length: a verified in-place
+/// patch. Where a [`PaletteSite`] writes a colour the renderer reads and an
+/// [`EventSite`] detours a call, this simply replaces the bytes, which covers
+/// injecting UI text (overwrite a string literal the app draws) and neutralising
+/// a function (write a return over its entry). `replacement_bytes` must be the
+/// same length as `expected_bytes` so nothing around the site shifts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BytePatchSite {
+    /// The maycord token this patch carries (e.g. `"settings-subtitle"`).
+    pub token: String,
+    /// Offset of the first byte to replace within the image.
+    pub image_offset: u64,
+    /// The exact bytes expected at `image_offset`; the loader refuses to patch on
+    /// mismatch, so it can't scribble on the wrong build.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// What to write in their place. Must be the same length as `expected_bytes`.
+    #[serde(with = "hex_bytes")]
+    pub replacement_bytes: Vec<u8>,
+    /// Optional signature to relocate this patch when the build has drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+}
+
+impl BytePatchSite {
+    /// The runtime address of the first patched byte given the image's load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
+
+    /// Whether the replacement is a same-length swap, which is the only kind that
+    /// is safe to write in place.
+    pub fn is_length_preserving(&self) -> bool {
+        self.replacement_bytes.len() == self.expected_bytes.len()
+    }
+}
+
 /// The exact identity of one build. If the whole-file SHA-256 matches, the bytes
 /// are identical, so the architecture, image id, and every site's expected bytes
 /// all hold too. The extra fields let the loader give a precise reason and
@@ -217,6 +254,9 @@ pub enum VerifyError {
     NoSites,
     /// Two sites claimed the same token, so which one wins is ambiguous.
     DuplicateToken(String),
+    /// A byte patch's replacement is a different length than what it replaces, so
+    /// writing it would shift everything after the site.
+    BytePatchLengthMismatch { token: String },
 }
 
 impl core::fmt::Display for VerifyError {
@@ -230,6 +270,10 @@ impl core::fmt::Display for VerifyError {
             ),
             Self::NoSites => write!(f, "adapter declares no palette sites"),
             Self::DuplicateToken(t) => write!(f, "token `{t}` is claimed by two sites"),
+            Self::BytePatchLengthMismatch { token } => write!(
+                f,
+                "byte patch `{token}` replacement differs in length from what it replaces"
+            ),
         }
     }
 }
@@ -250,6 +294,10 @@ pub struct TargetAdapter {
     /// Functions to detour into plugin events. Empty for theme-only adapters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<EventSite>,
+    /// Same-length byte overwrites: inject UI text, neutralise a function. Empty
+    /// unless the adapter patches bytes directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub patches: Vec<BytePatchSite>,
 }
 
 impl TargetAdapter {
@@ -257,12 +305,19 @@ impl TargetAdapter {
     /// two sites claim the same token. Call this once when loading an adapter,
     /// before trusting [`site`](Self::site) or [`supports`](Self::supports).
     pub fn validate(&self) -> Result<(), VerifyError> {
-        if self.sites.is_empty() && self.events.is_empty() {
+        if self.sites.is_empty() && self.events.is_empty() && self.patches.is_empty() {
             return Err(VerifyError::NoSites);
         }
         for (i, site) in self.sites.iter().enumerate() {
             if self.sites[..i].iter().any(|s| s.token == site.token) {
                 return Err(VerifyError::DuplicateToken(site.token.clone()));
+            }
+        }
+        for patch in &self.patches {
+            if !patch.is_length_preserving() {
+                return Err(VerifyError::BytePatchLengthMismatch {
+                    token: patch.token.clone(),
+                });
             }
         }
         Ok(())
@@ -365,6 +420,7 @@ mod tests {
                 signature: None,
             }],
             events: vec![],
+            patches: vec![],
         }
     }
 

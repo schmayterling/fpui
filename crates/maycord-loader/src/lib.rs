@@ -432,11 +432,47 @@ pub fn check_patches(adapter: &TargetAdapter, build: &[u8]) -> PatchReport {
         );
         patches.push(status(event_label(&event.event), event.image_offset, loc));
     }
+    for patch in &adapter.patches {
+        let loc = locate(
+            build,
+            patch.image_offset,
+            &patch.expected_bytes,
+            patch.signature.as_ref(),
+        );
+        patches.push(status(patch.token.clone(), patch.image_offset, loc));
+    }
     PatchReport {
         identity_matches: sha256 == adapter.identity.sha256,
         sha256,
         patches,
     }
+}
+
+/// Apply every byte patch in `adapter` to an image in place, overwriting each
+/// site's bytes with its replacement. Each patch is located by its offset or
+/// signature and its expected bytes are verified first, so a patch that doesn't
+/// fit this build is skipped rather than written to the wrong place. Returns one
+/// `(token, applied)` per patch. This is a static, offline apply used for
+/// testing and tooling; the agent applies the same patches in live memory.
+pub fn apply_byte_patches(adapter: &TargetAdapter, image: &mut [u8]) -> Vec<(String, bool)> {
+    adapter
+        .patches
+        .iter()
+        .map(|patch| {
+            let fits = patch.replacement_bytes.len() == patch.expected_bytes.len();
+            let applied = fits
+                && match locate(image, patch.image_offset, &patch.expected_bytes, patch.signature.as_ref()) {
+                    Located::At(off) => {
+                        let start = off as usize;
+                        image[start..start + patch.replacement_bytes.len()]
+                            .copy_from_slice(&patch.replacement_bytes);
+                        true
+                    }
+                    Located::Missing => false,
+                };
+            (patch.token.clone(), applied)
+        })
+        .collect()
 }
 
 /// macOS launch: check the target on disk, then start it with the agent dylib
@@ -488,7 +524,7 @@ pub fn launch_linux(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use maycord_target::{Arch, ImageId, PaletteSite, TargetIdentity};
+    use maycord_target::{Arch, BytePatchSite, ImageId, PaletteSite, TargetIdentity};
 
     fn adapter_with(sites: Vec<PaletteSite>, exe: &[u8]) -> TargetAdapter {
         TargetAdapter {
@@ -500,6 +536,7 @@ mod tests {
             },
             sites,
             events: vec![],
+            patches: vec![],
         }
     }
 
@@ -725,6 +762,31 @@ mod tests {
         assert_eq!(occurrences(&a, &cross.bytes), 1);
         assert_eq!(occurrences(&b, &cross.bytes), 1);
         assert!(cross.bytes.len() > EXPECT.len());
+    }
+
+    #[test]
+    fn apply_byte_patches_overwrites_verified_sites_in_place() {
+        // "General" at offset 4; patch it to the same-length "maycord".
+        let mut image = b"xxxxGeneralxxxx".to_vec();
+        let mut adapter = adapter_with(vec![], &image);
+        adapter.patches = vec![BytePatchSite {
+            token: "label".into(),
+            image_offset: 4,
+            expected_bytes: b"General".to_vec(),
+            replacement_bytes: b"maycord".to_vec(),
+            signature: None,
+        }];
+        let result = apply_byte_patches(&adapter, &mut image);
+        assert_eq!(result, vec![("label".to_string(), true)]);
+        assert_eq!(&image, b"xxxxmaycordxxxx");
+
+        // A patch whose expected bytes aren't there is reported unapplied and
+        // changes nothing.
+        let mut other = b"xxxxGeneralxxxx".to_vec();
+        adapter.patches[0].expected_bytes = b"Special".to_vec();
+        adapter.patches[0].replacement_bytes = b"maycord".to_vec();
+        assert_eq!(apply_byte_patches(&adapter, &mut other), vec![("label".to_string(), false)]);
+        assert_eq!(&other, b"xxxxGeneralxxxx");
     }
 
     #[test]
