@@ -201,7 +201,9 @@ mod frida_backend {
 
     use frida_gum::interceptor::{InvocationContext, InvocationListener, Interceptor, ProbeListener};
     use frida_gum::{Gum, NativePointer};
-    use maycord_target::{ArgOp, EventKind, ReturnOp, StringArg, TargetAdapter, ValueLocation};
+    use maycord_target::{
+        ArgOp, EventKind, ReplaceOp, ReturnOp, StringArg, TargetAdapter, ValueLocation,
+    };
 
     use crate::{EncodedColor, PlannedWrite};
 
@@ -442,6 +444,81 @@ mod frida_backend {
             interceptor
                 .attach(np, probe)
                 .map_err(|e| io::Error::other(format!("attach arg at {addr:#x}: {e:?}")))?;
+        }
+        Box::leak(Box::new((gum, interceptor)));
+        Ok(())
+    }
+
+    /// The per-site datum frida carries into the bare replacement through
+    /// `replacement_data`: one `u64` today, so a single shared replacement can
+    /// serve every `ReturnConst` site without a generated thunk per site.
+    struct ReplaceCtx {
+        value: u64,
+    }
+
+    /// The one shared replacement installed for every `ReturnConst` site. It is
+    /// declared with no arguments (`ReturnConst` ignores them) and a `usize`
+    /// return, which the compiler places in `x0`/`rax` — correct only for a callee
+    /// whose result is an integer, pointer or bool in that register (the ABI
+    /// contract `ReplaceOp::ReturnConst` documents). Plain `replace` pushes an
+    /// invocation context, so `current_invocation()` is valid here and hands back
+    /// this site's `ReplaceCtx`.
+    unsafe extern "C" fn return_const_replacement() -> usize {
+        let mut inv = Interceptor::current_invocation();
+        match inv.replacement_data() {
+            // SAFETY: the pointer is the `ReplaceCtx` leaked in `attach_replaces`
+            // and handed to `replace` as this site's `replacement_data`; it lives
+            // for the whole process and is only ever read here.
+            Some(p) => unsafe { (*(p.0 as *const ReplaceCtx)).value as usize },
+            None => 0,
+        }
+    }
+
+    /// Replace each `instead` site outright — checking its pinned entry bytes
+    /// first, like the detour family — so the real body never runs and the
+    /// `ReplaceOp` supplies the result. frida relocates the displaced prologue
+    /// into a trampoline (returned as the original, which `ReturnConst` ignores),
+    /// so there is no length budget on the entry. A moved site is skipped and
+    /// reported, not fatal.
+    pub fn attach_replaces(adapter: &TargetAdapter, image_base: u64) -> io::Result<()> {
+        let gum = Gum::obtain();
+        let mut interceptor = Interceptor::obtain(&gum);
+        for site in &adapter.replaces {
+            let addr = site.runtime_addr(image_base);
+            // SAFETY: read-only check of the pinned bytes at the resolved entry.
+            let actual = unsafe {
+                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
+            };
+            if actual != site.expected_bytes.as_slice() {
+                eprintln!(
+                    "maycord: skipping replace site `{}` at {addr:#x}; pinned bytes moved",
+                    site.token
+                );
+                continue;
+            }
+            match site.op {
+                ReplaceOp::ReturnConst { value } => {
+                    // Leak the per-site ctx for the process lifetime, like every
+                    // other detour here; frida hands its pointer back in the hook.
+                    let ctx = Box::leak(Box::new(ReplaceCtx { value })) as *mut ReplaceCtx;
+                    let repl_fn: unsafe extern "C" fn() -> usize = return_const_replacement;
+                    let func = NativePointer(addr as *mut core::ffi::c_void);
+                    let repl = NativePointer(repl_fn as *mut core::ffi::c_void);
+                    let data = NativePointer(ctx as *mut core::ffi::c_void);
+                    // The Ok value is the original trampoline; ReturnConst never
+                    // calls it, so it is dropped.
+                    interceptor
+                        .replace(func, repl, data)
+                        .map_err(|e| io::Error::other(format!("replace at {addr:#x}: {e:?}")))?;
+                }
+                // A future ReplaceOp variant (e.g. call-through) is not
+                // handled by this build; skip the site rather than guess at
+                // its ABI.
+                _ => eprintln!(
+                    "maycord: skipping replace site `{}`; unsupported replace op",
+                    site.token
+                ),
+            }
         }
         Box::leak(Box::new((gum, interceptor)));
         Ok(())
@@ -721,6 +798,15 @@ pub fn run() -> io::Result<()> {
     if !adapter.args.is_empty() {
         if let Err(e) = frida_backend::attach_args(&adapter, base) {
             eprintln!("maycord: arg override failed: {e}");
+        }
+    }
+    // Function replacements (Vencord `instead`): detour an entry so the body
+    // never runs and a `ReplaceOp` supplies the result. Live and reversible,
+    // attached on their own like the return/arg overrides.
+    #[cfg(all(target_os = "macos", feature = "frida"))]
+    if !adapter.replaces.is_empty() {
+        if let Err(e) = frida_backend::attach_replaces(&adapter, base) {
+            eprintln!("maycord: function replace failed: {e}");
         }
     }
 

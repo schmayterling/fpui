@@ -318,6 +318,56 @@ impl ArgSite {
     }
 }
 
+/// How to replace a detoured function. Unlike a [`ReturnOp`] (which runs the body
+/// then rewrites the result) or a force-return byte patch (which statically
+/// overwrites the entry), a `ReplaceOp` stands in for the function: the body never
+/// runs, and the replacement is a live, reversible frida detour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReplaceOp {
+    /// Skip the body entirely and return this fixed word — the live, reversible,
+    /// full-width analog of a force-return byte patch. Safe only for a function
+    /// that returns an integer, pointer or bool in the primary return register;
+    /// pointing it at a float- or struct-returning function is a correctness bug
+    /// the adapter author must avoid (it can't be detected from the entry bytes).
+    ReturnConst { value: u64 },
+}
+
+/// A function in the target to detour so maycord replaces it outright: the body
+/// does not run and the [`ReplaceOp`] supplies the result (Vencord `instead`).
+/// Pinned to the function entry by exact bytes like a [`ReturnSite`], and
+/// relocatable by [`Signature`] or [`StringAnchor`]; the live detour re-checks the
+/// pinned bytes before replacing, so a drifted entry is skipped, not hit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceSite {
+    /// A label for logs (e.g. `"is-premium"`).
+    pub token: String,
+    /// Image-relative address of the function's entry instruction.
+    pub image_offset: u64,
+    /// The exact bytes expected there; the loader refuses to replace on mismatch.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// How to replace the function.
+    pub op: ReplaceOp,
+    /// Optional signature to relocate this entry when the build has drifted. When
+    /// absent, the entry is pinned only to its exact `image_offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+    /// Optional string anchor to re-find this function's entry when the build has
+    /// drifted. When present, the loader resolves it at load time and overwrites
+    /// `image_offset` with the recovered entry before the byte check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StringAnchor>,
+}
+
+impl ReplaceSite {
+    /// The runtime address of the function entry given the image's load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
+}
+
 /// A spot to overwrite with new bytes of the same length: a verified in-place
 /// patch. Where a [`PaletteSite`] writes a colour the renderer reads and an
 /// [`EventSite`] detours a call, this simply replaces the bytes, which covers
@@ -441,6 +491,11 @@ pub struct TargetAdapter {
     /// `before`). Empty unless the adapter overrides an argument.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<ArgSite>,
+    /// Functions maycord replaces outright: the body never runs and the
+    /// [`ReplaceOp`] supplies the result (Vencord `instead`). Empty unless the
+    /// adapter replaces a function.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaces: Vec<ReplaceSite>,
     /// Same-length byte overwrites: inject UI text, neutralise a function. Empty
     /// unless the adapter patches bytes directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -457,6 +512,7 @@ impl TargetAdapter {
             && self.patches.is_empty()
             && self.returns.is_empty()
             && self.args.is_empty()
+            && self.replaces.is_empty()
         {
             return Err(VerifyError::NoSites);
         }
@@ -574,6 +630,7 @@ mod tests {
             events: vec![],
             returns: vec![],
             args: vec![],
+            replaces: vec![],
             patches: vec![],
         }
     }
@@ -695,6 +752,33 @@ mod tests {
         // Force ignores what the caller passed and yields the fixed word.
         assert_eq!(ArgOp::Force { value: 0 }.rewrite(0x9999), 0);
         assert_eq!(ArgOp::Force { value: 42 }.rewrite(7), 42);
+    }
+
+    #[test]
+    fn a_replace_site_round_trips_and_resolves_its_addr() {
+        let mut a = adapter();
+        a.replaces = vec![ReplaceSite {
+            token: "is-premium".into(),
+            image_offset: 0xb000,
+            expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
+            op: ReplaceOp::ReturnConst { value: u64::MAX },
+            signature: None,
+            anchor: None,
+        }];
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
+        assert_eq!(a.replaces[0].runtime_addr(0x1_0000_0000), 0x1_0000_b000);
+        // A full-width sentinel carries a value no `movz` byte patch could encode.
+        assert!(matches!(
+            a.replaces[0].op,
+            ReplaceOp::ReturnConst { value } if value == u64::MAX
+        ));
+        // The NoSites guard counts replaces: an adapter whose only sites are
+        // replaces still validates.
+        let mut only = adapter();
+        only.sites.clear();
+        only.replaces = a.replaces.clone();
+        assert!(only.validate().is_ok());
     }
 
     #[test]

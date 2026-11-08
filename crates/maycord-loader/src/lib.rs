@@ -448,6 +448,7 @@ fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped:
         .filter_map(|e| e.anchor.as_ref())
         .chain(resolved.returns.iter().filter_map(|r| r.anchor.as_ref()))
         .chain(resolved.args.iter().filter_map(|a| a.anchor.as_ref()))
+        .chain(resolved.replaces.iter().filter_map(|p| p.anchor.as_ref()))
         .map(|a| a.text.as_str())
         .collect();
     if texts.is_empty() {
@@ -499,6 +500,21 @@ fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped:
             }
             _ => {
                 dropped.push(a.token.clone());
+                false
+            }
+        }
+    });
+    resolved.replaces.retain_mut(|p| {
+        if p.anchor.is_none() {
+            return true;
+        }
+        match anchors.next() {
+            Some(Ok(hit)) => {
+                p.image_offset = hit.func_offset;
+                true
+            }
+            _ => {
+                dropped.push(p.token.clone());
                 false
             }
         }
@@ -649,6 +665,7 @@ mod tests {
             events: vec![],
             returns: vec![],
             args: vec![],
+            replaces: vec![],
             patches: vec![],
         }
     }

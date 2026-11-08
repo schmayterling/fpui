@@ -6,7 +6,8 @@
 
 use maycord_loader::{anchor, resolve_adapter};
 use maycord_target::{
-    Arch, ImageId, ReturnOp, ReturnSite, StringAnchor, TargetAdapter, TargetIdentity,
+    Arch, ImageId, ReplaceOp, ReplaceSite, ReturnOp, ReturnSite, StringAnchor, TargetAdapter,
+    TargetIdentity,
 };
 
 /// The string only `anchor_target` references.
@@ -44,8 +45,31 @@ fn adapter(returns: Vec<ReturnSite>) -> TargetAdapter {
         events: vec![],
         returns,
         args: vec![],
+        replaces: vec![],
         patches: vec![],
     }
+}
+
+#[test]
+fn resolve_adapter_rewrites_an_anchored_replace_site() {
+    // A `replace` site threads through the same anchor machinery as returns:
+    // its image_offset is a lie the sentinel anchor must correct to the real
+    // `anchor_target` entry at 0x460.
+    let mut a = adapter(vec![]);
+    a.replaces = vec![ReplaceSite {
+        token: "guard".into(),
+        image_offset: 0xBEEF,
+        expected_bytes: vec![0x00, 0x00, 0x00, 0x90],
+        op: ReplaceOp::ReturnConst { value: 0 },
+        signature: None,
+        anchor: Some(StringAnchor { text: SENTINEL.into() }),
+    }];
+
+    let (resolved, dropped) = resolve_adapter(&a, IMAGE);
+
+    assert!(dropped.is_empty());
+    assert_eq!(resolved.replaces.len(), 1);
+    assert_eq!(resolved.replaces[0].image_offset, TARGET_FILE_OFFSET);
 }
 
 #[test]
