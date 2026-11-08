@@ -412,9 +412,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_adrp_add_matches_a_real_zed_pair() {
-        // From /Applications/Zed.app: at 0x1_0000_1ec8 `adrp x2, 0x1_09fa_e000`
-        // then `add x2, x2, #0x5a0`, forming 0x1_09fa_e5a0 (verified with otool).
+    fn decode_adrp_add_matches_a_real_instruction_pair() {
+        // A real aarch64 pair from a stripped release build: at 0x1_0000_1ec8
+        // `adrp x2, 0x1_09fa_e000` then `add x2, x2, #0x5a0`, forming
+        // 0x1_09fa_e5a0 (cross-checked against a disassembler).
         let (rd, page) = decode_adrp(0xb004_fd62, 0x1_0000_1ec8).expect("is adrp");
         assert_eq!(rd, 2);
         assert_eq!(page, 0x1_09fa_e000);
@@ -451,9 +452,10 @@ mod tests {
     }
 
     #[test]
-    fn chained_rebase_offset_decodes_a_real_zed_location_pointer() {
-        // From /Applications/Zed.app: the `Location` for "crates/gpui/src/color.rs"
-        // at vmaddr 0x1_0a1f_0430 stores file pointer 0x0030_0000_078b_6449 on disk
+    fn chained_rebase_offset_decodes_a_real_location_pointer() {
+        // A real `core::panic::Location` from a stripped release build: the record
+        // for a gpui source path at vmaddr 0x1_0a1f_0430 stores file pointer
+        // 0x0030_0000_078b_6449 on disk
         // (LC_DYLD_CHAINED_FIXUPS rebase, verified with xxd). The low 40 bits are
         // the string's image-relative offset 0x78b_6449; the high bits are chain
         // metadata (here next=6: the +24-byte stride to the next `Location`).
