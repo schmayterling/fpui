@@ -76,6 +76,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "maycord-loader"
+version = "0.1.0"
+dependencies = [
+ "maycord-target",
+ "maycord-theme",
+]
+
+[[package]]
 name = "maycord-manifest"
 version = "0.1.0"
 dependencies = [
