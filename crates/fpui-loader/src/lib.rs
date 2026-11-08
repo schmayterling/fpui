@@ -19,7 +19,7 @@
 //! touches one checked color slot at a fixed spot.
 
 use fpui_target::{
-    ColorEncoding, EventKind, Signature, TargetAdapter, ValueLocation, VerifyError,
+    ColorEncoding, Signature, TargetAdapter, ValueLocation, VerifyError,
 };
 use fpui_theme::{Rgba, Variant};
 
@@ -384,12 +384,6 @@ pub fn force_return_aarch64(value: u16) -> [u8; 8] {
     out
 }
 
-fn event_label(event: &EventKind) -> String {
-    match event {
-        EventKind::MessageReceived { .. } => "message_received".to_string(),
-        _ => "event".to_string(),
-    }
-}
 
 /// Rewrite every site and event offset to where it actually sits in `image`,
 /// using each one's signature to recover from drift. Sites that can't be located
@@ -424,7 +418,7 @@ pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter,
                 true
             }
             Located::Missing => {
-                dropped.push(event_label(&e.event));
+                dropped.push(e.hook.clone());
                 false
             }
         }
@@ -469,7 +463,7 @@ fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped:
                 true
             }
             _ => {
-                dropped.push(event_label(&e.event));
+                dropped.push(e.hook.clone());
                 false
             }
         }
@@ -557,7 +551,7 @@ pub fn check_patches(adapter: &TargetAdapter, build: &[u8]) -> PatchReport {
             &event.expected_bytes,
             event.signature.as_ref(),
         );
-        patches.push(status(event_label(&event.event), event.image_offset, loc));
+        patches.push(status(event.hook.clone(), event.image_offset, loc));
     }
     for patch in &adapter.patches {
         let loc = locate(

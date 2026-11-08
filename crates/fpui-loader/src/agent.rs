@@ -61,7 +61,7 @@ pub fn load_plugins(config: &str) -> io::Result<Host> {
 /// Own the hosted plugins on a dedicated thread: ready them, then run each
 /// detoured message through their message hook and let them observe the arrival.
 /// Keeping this off the detour's hot path is why wasm never runs inside a probe.
-fn plugin_consumer(config: String, rx: std::sync::mpsc::Receiver<(String, String)>) {
+fn plugin_consumer(config: String, rx: std::sync::mpsc::Receiver<(String, String, Vec<u8>)>) {
     let mut host = match load_plugins(&config) {
         Ok(host) => host,
         Err(e) => {
@@ -69,11 +69,11 @@ fn plugin_consumer(config: String, rx: std::sync::mpsc::Receiver<(String, String
             return;
         }
     };
-    host.broadcast(&fpui_host::Event::Ready);
-    for (author, text) in rx {
-        let processed = host.render_message(&author, &text);
-        host.broadcast(&fpui_host::Event::MessageDisplayed { author: author.clone() });
-        eprintln!("fpui: plugin saw message from {author}: {processed}");
+    // Each detoured event arrives as (hook, capability, payload) chosen by the
+    // adapter; hand it to every plugin granted that capability. fpui names no
+    // hook itself — the application (e.g. maycord) does.
+    for (hook, capability, payload) in rx {
+        host.observe(&fpui_manifest::Capability::new(capability), &hook, &payload);
     }
 }
 
@@ -202,7 +202,7 @@ mod frida_backend {
     use frida_gum::interceptor::{InvocationContext, InvocationListener, Interceptor, ProbeListener};
     use frida_gum::{Gum, NativePointer};
     use fpui_target::{
-        ArgOp, EventKind, ReplaceOp, ReturnOp, StringArg, TargetAdapter, ValueLocation,
+        ArgOp, ReplaceOp, ReturnOp, StringArg, TargetAdapter, ValueLocation,
     };
 
     use crate::{EncodedColor, PlannedWrite};
@@ -295,31 +295,33 @@ mod frida_backend {
         Ok(())
     }
 
-    /// A probe at a detoured function's entry: it copies the message's author and
-    /// text out of the call's arguments and queues them for the plugin thread. No
-    /// wasm or heavy work runs here, per the no-blocking-in-callback rule.
-    struct MessageProbe {
-        author: StringArg,
-        text: StringArg,
-        tx: Sender<(String, String)>,
+    /// A probe at a detoured function's entry: it reads the adapter's declared
+    /// string arguments out of the call and queues them — as a JSON-array payload
+    /// under the site's hook — for the plugin thread. No wasm or heavy work runs
+    /// here, per the no-blocking-in-callback rule.
+    struct EventProbe {
+        hook: String,
+        capability: String,
+        args: Vec<StringArg>,
+        tx: Sender<(String, String, Vec<u8>)>,
     }
 
-    impl ProbeListener for MessageProbe {
+    impl ProbeListener for EventProbe {
         fn on_hit(&mut self, context: InvocationContext) {
-            let read = |arg: StringArg| -> Option<String> {
+            let mut strings = Vec::with_capacity(self.args.len());
+            for arg in &self.args {
                 let ptr = context.arg(arg.ptr_arg as u32);
                 let len = context.arg(arg.len_arg as u32);
                 if ptr == 0 || len > 64 * 1024 {
-                    return None;
+                    return; // a bad argument drops the whole event, not a partial one
                 }
                 // SAFETY: the target passed (ptr, len) as a string argument; we
                 // read exactly `len` bytes (capped above) and never write.
                 let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-                Some(String::from_utf8_lossy(bytes).into_owned())
-            };
-            if let (Some(author), Some(text)) = (read(self.author), read(self.text)) {
-                let _ = self.tx.send((author, text));
+                strings.push(String::from_utf8_lossy(bytes).into_owned());
             }
+            let payload = serde_json::to_vec(&strings).unwrap_or_default();
+            let _ = self.tx.send((self.hook.clone(), self.capability.clone(), payload));
         }
     }
 
@@ -328,7 +330,7 @@ mod frida_backend {
     pub fn attach_events(
         adapter: &TargetAdapter,
         image_base: u64,
-        tx: Sender<(String, String)>,
+        tx: Sender<(String, String, Vec<u8>)>,
     ) -> io::Result<()> {
         let gum = Gum::obtain();
         let mut interceptor = Interceptor::obtain(&gum);
@@ -343,13 +345,16 @@ mod frida_backend {
                 eprintln!("fpui: skipping event site at {addr:#x}; pinned bytes moved");
                 continue;
             }
-            if let EventKind::MessageReceived { author, text } = site.event {
-                let probe = Box::leak(Box::new(MessageProbe { author, text, tx: tx.clone() }));
-                let np = NativePointer(addr as *mut core::ffi::c_void);
-                interceptor.attach_instruction(np, probe).map_err(|e| {
-                    io::Error::other(format!("attach event at {addr:#x}: {e:?}"))
-                })?;
-            }
+            let probe = Box::leak(Box::new(EventProbe {
+                hook: site.hook.clone(),
+                capability: site.capability.clone(),
+                args: site.args.clone(),
+                tx: tx.clone(),
+            }));
+            let np = NativePointer(addr as *mut core::ffi::c_void);
+            interceptor.attach_instruction(np, probe).map_err(|e| {
+                io::Error::other(format!("attach event at {addr:#x}: {e:?}"))
+            })?;
         }
         Box::leak(Box::new((gum, interceptor)));
         Ok(())
@@ -815,7 +820,7 @@ pub fn run() -> io::Result<()> {
     // thread owns the host, so wasm never runs on the detour's hot path.
     if let Some(path) = std::env::var_os("FPUI_PLUGINS") {
         let config = std::fs::read_to_string(path)?;
-        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String, Vec<u8>)>();
         std::thread::spawn(move || plugin_consumer(config, rx));
         #[cfg(all(target_os = "macos", feature = "frida"))]
         if !adapter.events.is_empty() {
@@ -933,7 +938,7 @@ mod tests {
         (local.set $p (global.get $heap))
         (global.set $heap (i32.add (global.get $heap) (local.get $n)))
         (local.get $p))
-      (func (export "fpui_transform_message") (param $ptr i32) (param $len i32) (result i64)
+      (func (export "fpui_transform") (param $hptr i32) (param $hlen i32) (param $ptr i32) (param $len i32) (result i64)
         (local $out i32) (local $i i32) (local $b i32)
         (local.set $out (call $alloc (local.get $len)))
         (block $done
@@ -962,6 +967,8 @@ mod tests {
         );
         let mut host = load_plugins(&config).unwrap();
         assert_eq!(host.len(), 1);
-        assert_eq!(host.render_message("a", "hello"), "HELLO");
+        let cap = fpui_manifest::Capability::new("message_content");
+        let out = host.transform(&cap, "message", b"hello");
+        assert_eq!(String::from_utf8(out).unwrap(), "HELLO");
     }
 }

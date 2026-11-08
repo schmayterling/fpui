@@ -1,25 +1,28 @@
 //! Write a fpui plugin and compile it to WebAssembly.
 //!
-//! fpui runs plugins as wasm modules (a native client has no JS engine to
-//! inject into). This crate is the guest side: it hides the raw host↔plugin ABI
-//! behind a small [`plugin!`] macro, modelled on Vencord's `definePlugin`, so a
-//! plugin author only writes the hook they care about:
+//! fpui runs plugins as wasm modules (a native app has no JS engine to inject
+//! into). This crate is the guest side: it hides the raw host↔plugin ABI behind
+//! a small [`plugin!`] macro, modelled on Vencord's `definePlugin`. fpui is
+//! general — a *hook* is just an application-defined name (`"message"`,
+//! `"draft"`, … defined by the app, e.g. maycord) carrying an opaque byte
+//! payload — so a plugin dispatches on the hook name:
 //!
 //! ```ignore
 //! fpui_plugin_sdk::plugin! {
-//!     transform_message: |content: &str| content.replace("secret", "[redacted]"),
+//!     transform: |hook: &str, payload: &[u8]| match hook {
+//!         "message" => Some(String::from_utf8_lossy(payload).to_uppercase().into_bytes()),
+//!         _ => None,
+//!     },
 //! }
 //! ```
 //!
-//! Compile that crate for `wasm32-unknown-unknown` as a `cdylib` and the result
-//! loads straight into [`fpui_wasm`](https://docs.rs). The macro emits the
-//! two exports the host calls — `fpui_alloc` and `fpui_transform_message`
-//! — using the helpers below.
+//! Compile for `wasm32-unknown-unknown` as a `cdylib` and the result loads into
+//! fpui's wasm host. The macro emits `fpui_alloc`, `fpui_transform`, and/or
+//! `fpui_observe` using the helpers below.
 
 /// Reserve `len` bytes in the plugin's own memory and return the offset. The
-/// host calls this, writes the input message there, then calls the transform.
-///
-/// The buffer is handed to the host and reclaimed by [`run_transform`], so it is
+/// host calls this to write a hook's input (name and payload) before the hook.
+/// The buffer is handed to the host and reclaimed by the hook glue, so it is
 /// deliberately leaked here.
 pub fn alloc(len: i32) -> i32 {
     let mut buf = vec![0u8; len.max(0) as usize];
@@ -28,53 +31,73 @@ pub fn alloc(len: i32) -> i32 {
     ptr
 }
 
-/// The glue behind `plugin!`'s message hook: read the input the host wrote, run
-/// the author's `transform`, and return the result packed as
-/// `(out_ptr as u64) << 32 | out_len as u64`.
+/// Take back a buffer the host allocated via [`alloc`] and filled, as an owned
+/// `Vec` that frees on drop.
+///
+/// # Safety
+/// `ptr`/`len` must name a buffer previously returned by [`alloc`] and not yet
+/// reclaimed — exactly what the host passes to a hook.
+unsafe fn take(ptr: i32, len: i32) -> Vec<u8> {
+    Vec::from_raw_parts(ptr as *mut u8, len.max(0) as usize, len.max(0) as usize)
+}
+
+/// The glue behind `plugin!`'s `transform`: read the hook name + payload the host
+/// wrote, run the author's dispatcher, and pack the result as
+/// `(out_ptr as u64) << 32 | out_len`. Returns `0` for `None`, which the host
+/// reads as "no change" and keeps the original payload.
 ///
 /// Ceiling: the output buffer is leaked so the host can read it after this
-/// returns, so a plugin's memory grows slowly over very many messages until it
-/// hits wasmi's cap, after which transforms no-op. A later ABI revision adds an
-/// explicit free; for now a plugin is cheap to reload.
-pub fn run_transform<F: FnOnce(&str) -> String>(ptr: i32, len: i32, transform: F) -> i64 {
-    let len = len.max(0) as usize;
-    // SAFETY: `ptr`/`len` name the buffer the host got from `alloc` and filled
-    // with the message before calling us; we take it back to free it.
-    let input = unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) };
-    let text = String::from_utf8_lossy(&input).into_owned();
-    drop(input);
-
-    let mut out = transform(&text).into_bytes();
-    let out_ptr = out.as_mut_ptr() as u32;
-    let out_len = out.len() as u32;
-    core::mem::forget(out);
-    (((out_ptr as u64) << 32) | out_len as u64) as i64
+/// returns, so a plugin's memory grows slowly over very many calls until wasmi's
+/// cap, after which transforms no-op. A later ABI revision adds an explicit free.
+pub fn run_transform<F: FnOnce(&str, &[u8]) -> Option<Vec<u8>>>(
+    hook_ptr: i32,
+    hook_len: i32,
+    in_ptr: i32,
+    in_len: i32,
+    dispatch: F,
+) -> i64 {
+    // SAFETY: the host alloc'd + filled both buffers before calling us.
+    let hook = unsafe { take(hook_ptr, hook_len) };
+    let payload = unsafe { take(in_ptr, in_len) };
+    let hook = String::from_utf8_lossy(&hook).into_owned();
+    match dispatch(&hook, &payload) {
+        Some(mut out) => {
+            let out_ptr = out.as_mut_ptr() as u32;
+            let out_len = out.len() as u32;
+            core::mem::forget(out);
+            (((out_ptr as u64) << 32) | out_len as u64) as i64
+        }
+        None => 0,
+    }
 }
 
-/// The glue behind `plugin!`'s `on_event` hook: read the versioned-JSON event
-/// the host wrote and hand it to the author's handler. Events are observe-only,
-/// so the handler returns nothing.
-pub fn run_event<F: FnOnce(&str)>(ptr: i32, len: i32, handler: F) {
-    let len = len.max(0) as usize;
-    // SAFETY: `ptr`/`len` name the buffer the host got from `alloc` and filled
-    // with the event JSON before calling us; we take it back to free it.
-    let input = unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) };
-    let json = String::from_utf8_lossy(&input).into_owned();
-    drop(input);
-    handler(&json);
+/// The glue behind `plugin!`'s `observe`: read the hook name + payload and hand
+/// them to the author's dispatcher. Observe hooks return nothing.
+pub fn run_observe<F: FnOnce(&str, &[u8])>(
+    hook_ptr: i32,
+    hook_len: i32,
+    in_ptr: i32,
+    in_len: i32,
+    dispatch: F,
+) {
+    // SAFETY: the host alloc'd + filled both buffers before calling us.
+    let hook = unsafe { take(hook_ptr, hook_len) };
+    let payload = unsafe { take(in_ptr, in_len) };
+    let hook = String::from_utf8_lossy(&hook).into_owned();
+    dispatch(&hook, &payload);
 }
 
-/// Define a fpui plugin. List the hooks you want; the macro emits the wasm
-/// exports fpui's host calls. Each hook takes the input `&str` and returns
-/// the rewritten `String`.
-///
-/// Hooks: `transform_message` (an incoming message) and `transform_draft` (the
-/// user's outgoing draft). An unknown hook name is a compile error.
+/// Define a fpui plugin. Provide a `transform` dispatcher, an `observe`
+/// dispatcher, or both; each takes the hook name and the opaque payload. The
+/// macro emits the wasm exports fpui's host calls.
 ///
 /// ```ignore
 /// fpui_plugin_sdk::plugin! {
-///     transform_message: |content| content.to_uppercase(),
-///     transform_draft: |draft| format!("{draft} — via fpui"),
+///     transform: |hook, payload| match hook {
+///         "message" => Some(payload.to_ascii_uppercase()),
+///         _ => None,
+///     },
+///     observe: |hook, _payload| { let _ = hook; },
 /// }
 /// ```
 #[macro_export]
@@ -85,35 +108,32 @@ macro_rules! plugin {
         pub extern "C" fn fpui_alloc(len: i32) -> i32 {
             $crate::alloc(len)
         }
-        $( $crate::__fpui_hook!($hook, $f); )+
+        $( $crate::__fpui_export!($hook, $f); )+
     };
 }
 
-/// Emit the wasm export for one named hook. Matching a hook name as a literal
-/// token means an unknown name simply has no rule, so it fails to compile.
+/// Emit the wasm export for one hook kind. Matching the kind as a literal token
+/// means an unknown kind simply has no rule, so it fails to compile.
 #[macro_export]
 #[doc(hidden)]
-macro_rules! __fpui_hook {
-    (transform_message, $f:expr) => {
-        /// Transform one message: the host wrote the UTF-8 text at `ptr..ptr+len`.
+macro_rules! __fpui_export {
+    (transform, $f:expr) => {
+        /// Transform dispatch: the host wrote the hook name and payload.
         #[no_mangle]
-        pub extern "C" fn fpui_transform_message(ptr: i32, len: i32) -> i64 {
-            $crate::run_transform(ptr, len, $f)
+        pub extern "C" fn fpui_transform(
+            hook_ptr: i32,
+            hook_len: i32,
+            in_ptr: i32,
+            in_len: i32,
+        ) -> i64 {
+            $crate::run_transform(hook_ptr, hook_len, in_ptr, in_len, $f)
         }
     };
-    (transform_draft, $f:expr) => {
-        /// Transform the outgoing draft: the host wrote the UTF-8 text at `ptr..ptr+len`.
+    (observe, $f:expr) => {
+        /// Observe dispatch: the host wrote the hook name and payload.
         #[no_mangle]
-        pub extern "C" fn fpui_transform_draft(ptr: i32, len: i32) -> i64 {
-            $crate::run_transform(ptr, len, $f)
-        }
-    };
-    (on_event, $f:expr) => {
-        /// Observe an event: the host wrote the versioned-JSON event at `ptr..ptr+len`.
-        /// The handler takes the JSON `&str` and returns nothing.
-        #[no_mangle]
-        pub extern "C" fn fpui_on_event(ptr: i32, len: i32) {
-            $crate::run_event(ptr, len, $f)
+        pub extern "C" fn fpui_observe(hook_ptr: i32, hook_len: i32, in_ptr: i32, in_len: i32) {
+            $crate::run_observe(hook_ptr, hook_len, in_ptr, in_len, $f)
         }
     };
 }

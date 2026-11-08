@@ -51,22 +51,43 @@ pub enum ExtensionKind {
 /// A permission a plugin requests in its manifest and the user approves before
 /// the plugin loads. Themes never have capabilities.
 ///
-/// The list is deliberately small and only grows over time. An older host that
-/// doesn't recognize a capability rejects the plugin rather than ignoring it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum Capability {
-    /// Read or change the text of messages the client shows.
-    MessageContent,
-    /// Read or change the user's draft before it is sent.
-    Composer,
-    /// Save and read the plugin's own key/value data.
-    Storage,
-    /// Add colors or styling beyond a plain theme package.
-    Appearance,
-    /// Watch lifecycle and UI events the host sends out.
-    Events,
+/// The *name* is defined by the application layer, not by fpui: a chat app like
+/// maycord names capabilities like `message-content` or `composer`, while
+/// another GPUI app names its own. fpui only transports the string and gates a
+/// hook on whether the plugin was granted it. An older host still rejects a
+/// plugin whose granted set it can't satisfy, rather than ignoring a capability.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Capability(pub String);
+
+impl Capability {
+    /// A capability from any string-like name.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    /// The capability's name.
+    pub fn name(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for Capability {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl From<String> for Capability {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl core::fmt::Display for Capability {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Why a [`Manifest`] was rejected.
@@ -97,7 +118,7 @@ impl core::fmt::Display for ManifestError {
             Self::ThemeWithCapabilities => {
                 write!(f, "a theme package must not declare capabilities")
             }
-            Self::DuplicateCapability(cap) => write!(f, "capability {cap:?} listed twice"),
+            Self::DuplicateCapability(cap) => write!(f, "capability {cap} listed twice"),
         }
     }
 }
@@ -134,7 +155,7 @@ impl Manifest {
         }
         for (i, cap) in self.capabilities.iter().enumerate() {
             if self.capabilities[..i].contains(cap) {
-                return Err(ManifestError::DuplicateCapability(*cap));
+                return Err(ManifestError::DuplicateCapability(cap.clone()));
             }
         }
         Ok(())
@@ -199,7 +220,7 @@ mod tests {
     #[test]
     fn a_theme_may_not_hold_capabilities() {
         let mut m = theme();
-        m.capabilities = vec![Capability::Storage];
+        m.capabilities = vec![Capability::new("storage")];
         assert_eq!(m.validate(), Err(ManifestError::ThemeWithCapabilities));
     }
 
@@ -207,10 +228,10 @@ mod tests {
     fn catches_duplicate_capabilities() {
         let mut m = theme();
         m.kind = ExtensionKind::Plugin;
-        m.capabilities = vec![Capability::Storage, Capability::Storage];
+        m.capabilities = vec![Capability::new("storage"), Capability::new("storage")];
         assert_eq!(
             m.validate(),
-            Err(ManifestError::DuplicateCapability(Capability::Storage))
+            Err(ManifestError::DuplicateCapability(Capability::new("storage")))
         );
     }
 

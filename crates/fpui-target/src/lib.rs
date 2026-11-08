@@ -158,17 +158,6 @@ pub struct StringArg {
     pub len_arg: u8,
 }
 
-/// The fpui event a detoured function stands for, and where to read its data
-/// from the call's arguments.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum EventKind {
-    /// The client received a message; `author` and `text` name the string
-    /// arguments the function was called with.
-    MessageReceived { author: StringArg, text: StringArg },
-}
-
 /// A function in the target to detour, so fpui can turn a backend call into an
 /// event for hosted plugins. Pinned to the function's entry by exact bytes, like
 /// a [`PaletteSite`].
@@ -179,8 +168,16 @@ pub struct EventSite {
     /// The exact bytes expected there; the loader refuses to detour on mismatch.
     #[serde(with = "hex_bytes")]
     pub expected_bytes: Vec<u8>,
-    /// Which event this function produces and how to read it.
-    pub event: EventKind,
+    /// The application-defined hook name the extracted payload is delivered
+    /// under (e.g. maycord's `"message-received"`). fpui names no hook itself.
+    pub hook: String,
+    /// The capability a plugin must hold to receive this hook — an app-defined
+    /// name, not an engine concept.
+    pub capability: String,
+    /// The string arguments to read from the detoured call, in order. The payload
+    /// handed to plugins is a JSON array of them; empty means an empty payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<StringArg>,
     /// Optional signature to relocate this entry when the build has drifted. When
     /// absent, the entry is pinned only to its exact `image_offset`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -691,10 +688,12 @@ mod tests {
         a.events = vec![EventSite {
             image_offset: 0x4000,
             expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
-            event: EventKind::MessageReceived {
-                author: StringArg { ptr_arg: 0, len_arg: 1 },
-                text: StringArg { ptr_arg: 2, len_arg: 3 },
-            },
+            hook: "message-received".into(),
+            capability: "events".into(),
+            args: vec![
+                StringArg { ptr_arg: 0, len_arg: 1 },
+                StringArg { ptr_arg: 2, len_arg: 3 },
+            ],
             signature: None,
             anchor: None,
         }];

@@ -1,13 +1,9 @@
-//! An example fpui plugin showing all three hooks: it uppercases incoming
-//! messages, tags the outgoing draft, and observes lifecycle events.
-//!
-//! Build it for wasm, then load the result in fpui:
+//! An example fpui plugin: ASCII-uppercases the payload of the `message` hook,
+//! ignoring any other hook. Build for wasm:
 //!   cargo build --release --target wasm32-unknown-unknown
-//!   # -> target/wasm32-unknown-unknown/release/uppercase_plugin.wasm
 fpui_plugin_sdk::plugin! {
-    transform_message: |content: &str| content.to_uppercase(),
-    transform_draft: |draft: &str| format!("{draft} — via fpui"),
-    // `event` is the versioned JSON, e.g. {"v":1,"type":"ready"}. A real plugin
-    // would react here; this example just accepts them.
-    on_event: |_event: &str| {},
+    transform: |hook: &str, payload: &[u8]| match hook {
+        "message" => Some(String::from_utf8_lossy(payload).to_uppercase().into_bytes()),
+        _ => None,
+    },
 }
