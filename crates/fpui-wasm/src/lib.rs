@@ -9,6 +9,11 @@
 //! breaks the protocol, the payload is left as-is instead of taking the client
 //! down: a misbehaving mod must never break the app.
 //!
+//! Each plugin's linear memory is capped as well (see [`MAX_MEMORY_BYTES`]): a
+//! module that merely *declares* a huge initial memory is refused at load time,
+//! before it can allocate it. Fuel can't guard that reservation, since fuel is
+//! only spent once code is running.
+//!
 //! Capability enforcement is the host's job, not this crate's: [`fpui_host`]
 //! only invokes a hook the plugin was granted the matching capability for, so a
 //! wasm plugin without that grant is simply never asked to run the hook. When
@@ -30,9 +35,24 @@
 //! guest's memory. Both hooks are optional; a plugin exports only what it
 //! implements. fpui never interprets the hook name or the payload — that is the
 //! application's job.
+//!
+//! ## JavaScript plugins (the `js` feature)
+//! With `--features js`, [`JavyPlugin`] runs a plugin authored in JavaScript. It
+//! is a [Javy](https://github.com/bytecodealliance/javy)-produced module —
+//! QuickJS compiled *to* wasm — so the JS engine is wasm data interpreted by the
+//! same wasmi host: no new executable memory, the sandbox intact. It speaks
+//! Javy's WASI-command ABI (payload on stdin, result on stdout) behind a
+//! minimal, in-memory-only shim, rather than the ptr/len ABI above. The feature
+//! is off by default so the plain-wasm host stays lean (it pulls in wasmi's
+//! `simd` support, which QuickJS-wasm needs).
 
 use fpui_host::Plugin;
-use wasmi::{Config, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmi::{Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc};
+
+#[cfg(feature = "js")]
+mod javy;
+#[cfg(feature = "js")]
+pub use javy::JavyPlugin;
 
 /// Fuel spent per hook call before the guest is trapped. Generous for a text
 /// transform, small enough that a runaway loop dies in milliseconds.
@@ -40,7 +60,17 @@ pub const DEFAULT_FUEL: u64 = 50_000_000;
 
 /// The largest output a guest may return from a transform, capping memory a
 /// malicious module can make the host allocate.
-const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
+/// The ceiling on one plugin's linear memory. wasmi consults this on the initial
+/// reservation *and* every `memory.grow`, so a module that merely declares a
+/// huge memory is refused when it loads instead of OOM-ing the target — fuel
+/// can't help there, as it is only spent once code runs. Sized well above
+/// [`MAX_OUTPUT`]: a transform building up to a 16 MiB result holds it in this
+/// same linear memory, alongside its input and working copies. Roomy for real
+/// guests (a QuickJS/Javy engine settles around ~1.5 MiB) yet orders of
+/// magnitude below the multi-GiB reservation a hostile module would ask for.
+pub(crate) const MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Why a wasm module could not be loaded as a plugin.
 #[derive(Debug)]
@@ -68,7 +98,7 @@ impl std::error::Error for WasmError {}
 /// A loaded wasm plugin. Holds its own [`Store`] (and therefore its own linear
 /// memory and fuel), so plugins never share state.
 pub struct WasmPlugin {
-    store: Store<()>,
+    store: Store<StoreLimits>,
     memory: Memory,
     alloc: Option<TypedFunc<i32, i32>>,
     transform: Option<TypedFunc<(i32, i32, i32, i32), i64>>,
@@ -88,7 +118,12 @@ impl WasmPlugin {
         config.consume_fuel(true);
         let engine = Engine::new(&config);
         let module = Module::new(&engine, wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
-        let mut store = Store::new(&engine, ());
+        let limits = StoreLimitsBuilder::new().memory_size(MAX_MEMORY_BYTES).build();
+        let mut store = Store::new(&engine, limits);
+        // Cap linear memory before instantiation, which is where the module's
+        // declared memory is reserved: an over-large request is denied here
+        // rather than allocated and left for fuel (which never runs) to catch.
+        store.limiter(|limits| limits);
         // An initial budget so the start function (if any) cannot run forever.
         store.set_fuel(fuel_per_call).ok();
         let linker = Linker::new(&engine);
@@ -340,6 +375,22 @@ mod tests {
     #[test]
     fn a_non_module_is_rejected() {
         assert!(matches!(WasmPlugin::load(b"not wasm"), Err(WasmError::Compile(_))));
+    }
+
+    // Declares a ~3 GiB initial linear memory (50000 pages × 64 KiB). Valid wasm,
+    // but far past MAX_MEMORY_BYTES.
+    const HUGE_MEMORY_WAT: &str = r#"
+    (module
+      (memory (export "memory") 50000)
+      (func (export "fpui_alloc") (param i32) (result i32) (i32.const 0)))
+    "#;
+
+    #[test]
+    fn a_module_demanding_huge_memory_is_rejected_not_allocated() {
+        let wasm = wat::parse_str(HUGE_MEMORY_WAT).unwrap();
+        // The limiter denies the initial reservation, so instantiation fails
+        // instead of the host trying to back ~3 GiB of guest memory.
+        assert!(matches!(WasmPlugin::load(&wasm), Err(WasmError::Instantiate(_))));
     }
 
     #[test]
