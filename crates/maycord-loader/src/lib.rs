@@ -245,12 +245,27 @@ enum Located {
 /// occurrence and recover the drifted offset. Zero or several signature matches
 /// both count as missing, because maycord must never guess which copy to patch.
 fn locate(image: &[u8], hint: u64, expected: &[u8], signature: Option<&Signature>) -> Located {
-    if bytes_match(image, hint, expected) {
-        return Located::At(hint);
-    }
+    // Without a signature, the hint's exact bytes are the only evidence there is.
     let Some(sig) = signature else {
-        return Located::Missing;
+        return if bytes_match(image, hint, expected) {
+            Located::At(hint)
+        } else {
+            Located::Missing
+        };
     };
+    // With a signature, the hint alone is not trusted: a short `expected` window
+    // (e.g. a common function prologue like `sub sp, sp, #imm`) can match
+    // coincidentally at a stale hint on a drifted build, which would patch the
+    // wrong code. The hint's fast path only holds when the wider, unique
+    // signature window also sits exactly where the hint implies — then the site
+    // is positively confirmed and no full scan is needed.
+    if let Some(sig_start) = hint.checked_sub(sig.site_offset) {
+        if bytes_match(image, sig_start, &sig.bytes) && bytes_match(image, hint, expected) {
+            return Located::At(hint);
+        }
+    }
+    // Otherwise the site has drifted: recover it from the signature's single
+    // occurrence.
     let mut found = None;
     let mut from = 0;
     while let Some(at) = find_from(image, &sig.bytes, from) {
@@ -738,6 +753,22 @@ mod tests {
     fn locate_is_missing_when_the_hint_fails_and_there_is_no_signature() {
         let build = vec![0u8; 64];
         assert_eq!(at(locate(&build, 8, EXPECT, None)), None);
+    }
+
+    #[test]
+    fn locate_ignores_a_coincidental_hint_when_the_signature_disagrees() {
+        // A drifted build where the stale hint (8) STILL holds the short expected
+        // bytes — a common prologue collides there — but the real site, fixed by
+        // the unique signature window, is at 42. locate must follow the signature
+        // and never trust the coincidental hint (which it did before this guard).
+        let mut build = vec![0u8; 96];
+        build[8..12].copy_from_slice(EXPECT); // coincidental collision at the hint
+        build[40..42].copy_from_slice(&[0x5a, 0x5b]); // unique lead-in
+        build[42..46].copy_from_slice(EXPECT); // the real site, two bytes in
+        let mut window = vec![0x5a, 0x5b];
+        window.extend_from_slice(EXPECT);
+        let sig = Signature { bytes: window, site_offset: 2 };
+        assert_eq!(at(locate(&build, 8, EXPECT, Some(&sig))), Some(42));
     }
 
     #[test]
