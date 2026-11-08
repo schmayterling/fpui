@@ -24,6 +24,7 @@ use maycord_target::{
 use maycord_theme::{Rgba, Variant};
 
 pub mod agent;
+pub mod anchor;
 
 /// A color encoded the way a specific [`PaletteSite`](maycord_target::PaletteSite)
 /// expects it in memory.
