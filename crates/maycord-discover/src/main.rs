@@ -32,8 +32,8 @@ fn main() -> ExitCode {
                 continue;
             }
             match a.as_str() {
-                "--symbol" | "--offset" | "--token" | "--len" | "--max-radius" | "--also"
-                | "--force-return" => skip = true,
+                "--symbol" | "--offset" | "--anchor" | "--token" | "--len" | "--max-radius"
+                | "--also" | "--force-return" => skip = true,
                 s if s.starts_with("--") => {}
                 _ => out.push(a),
             }
@@ -136,7 +136,20 @@ fn site_offset(image: &[u8], args: &[String]) -> Result<u64, String> {
     if let Some(raw) = flag(args, "--offset") {
         return parse_u64(raw).ok_or_else(|| format!("bad --offset `{raw}`"));
     }
-    let name = flag(args, "--symbol").ok_or("need --symbol <name> or --offset <n>")?;
+    // Anchor by a stable string the target function references: find the string,
+    // find the one `adrp`+`add` that forms its address, and pin to the function
+    // that holds it. This survives recompiles where a byte signature would not,
+    // and needs no symbols — the stripped-binary case.
+    if let Some(text) = flag(args, "--anchor") {
+        let anchor = maycord_loader::anchor::resolve_anchor(image, text)
+            .map_err(|e| format!("anchor `{text}`: {e}"))?;
+        eprintln!(
+            "anchored to function at {:#x} via string {:#x} referenced from {:#x}",
+            anchor.func_offset, anchor.string_vmaddr, anchor.xref_offset
+        );
+        return Ok(anchor.func_offset);
+    }
+    let name = flag(args, "--symbol").ok_or("need --symbol <name>, --offset <n>, or --anchor <s>")?;
     let file = object::File::parse(image).map_err(|e| format!("parse object: {e}"))?;
     symbol_file_offset(&file, name)
         .ok_or_else(|| format!("symbol `{name}` not found (is this build stripped?)"))
