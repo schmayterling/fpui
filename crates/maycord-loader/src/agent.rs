@@ -199,9 +199,9 @@ mod frida_backend {
 
     use std::sync::mpsc::Sender;
 
-    use frida_gum::interceptor::{InvocationContext, Interceptor, ProbeListener};
+    use frida_gum::interceptor::{InvocationContext, InvocationListener, Interceptor, ProbeListener};
     use frida_gum::{Gum, NativePointer};
-    use maycord_target::{EventKind, StringArg, TargetAdapter, ValueLocation};
+    use maycord_target::{EventKind, ReturnOp, StringArg, TargetAdapter, ValueLocation};
 
     use crate::{EncodedColor, PlannedWrite};
 
@@ -352,6 +352,54 @@ mod frida_backend {
         Box::leak(Box::new((gum, interceptor)));
         Ok(())
     }
+
+    /// A listener on a whole function: it lets the body run, then rewrites the
+    /// return value as the function leaves. This is maycord's `after` primitive —
+    /// the caller sees a different answer, but the function's own work still ran.
+    /// Where a force-return byte patch overwrites the entry so the body never
+    /// executes, this keeps the side effects and only changes the result.
+    struct ReturnProbe {
+        op: ReturnOp,
+    }
+
+    impl InvocationListener for ReturnProbe {
+        fn on_enter(&mut self, _context: InvocationContext) {}
+
+        fn on_leave(&mut self, context: InvocationContext) {
+            let real = context.return_value() as u64;
+            context.set_return_value(self.op.rewrite(real) as usize);
+        }
+    }
+
+    /// Detour each return-override site — checking its pinned entry bytes first —
+    /// so the real function runs and maycord rewrites its result on the way out. A
+    /// moved site is skipped and reported, like the color and event sites, so one
+    /// drifted entry never blocks the others.
+    pub fn attach_returns(adapter: &TargetAdapter, image_base: u64) -> io::Result<()> {
+        let gum = Gum::obtain();
+        let mut interceptor = Interceptor::obtain(&gum);
+        for site in &adapter.returns {
+            let addr = site.runtime_addr(image_base);
+            // SAFETY: read-only check of the pinned bytes at the resolved entry.
+            let actual = unsafe {
+                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
+            };
+            if actual != site.expected_bytes.as_slice() {
+                eprintln!(
+                    "maycord: skipping return site `{}` at {addr:#x}; pinned bytes moved",
+                    site.token
+                );
+                continue;
+            }
+            let probe = Box::leak(Box::new(ReturnProbe { op: site.op }));
+            let np = NativePointer(addr as *mut core::ffi::c_void);
+            interceptor
+                .attach(np, probe)
+                .map_err(|e| io::Error::other(format!("attach return at {addr:#x}: {e:?}")))?;
+        }
+        Box::leak(Box::new((gum, interceptor)));
+        Ok(())
+    }
 }
 
 /// Where the main executable is loaded in memory (its preferred base plus the
@@ -465,6 +513,15 @@ pub fn run() -> io::Result<()> {
             } else {
                 return Err(e);
             }
+        }
+    }
+
+    // Return overrides need no plugins and no event channel: they detour a
+    // function and rewrite its result on the way out. Attach them on their own.
+    #[cfg(all(target_os = "macos", feature = "frida"))]
+    if !adapter.returns.is_empty() {
+        if let Err(e) = frida_backend::attach_returns(&adapter, base) {
+            eprintln!("maycord: return override failed: {e}");
         }
     }
 

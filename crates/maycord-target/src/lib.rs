@@ -181,6 +181,62 @@ impl EventSite {
     }
 }
 
+/// How to rewrite a detoured function's return value on the way out. Unlike a
+/// force-return byte patch — which overwrites the entry so the body never runs —
+/// a return override lets the real function run and only changes its result as it
+/// returns. This is the Vencord `Patcher.after` case: the code's side effects
+/// still happen, but the caller sees a different answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ReturnOp {
+    /// Replace the return value with a fixed word whatever the body computed —
+    /// like force-return, but after the body has run.
+    Force { value: u64 },
+    /// Read the return value as a boolean and return its negation (`0` becomes
+    /// `1`, anything else becomes `0`). The dynamic case: the new value depends
+    /// on the real one, so it can't be a static patch.
+    InvertBool,
+}
+
+impl ReturnOp {
+    /// The value to return in place of `real`, the value the function actually
+    /// produced. Pure so it can be unit-tested without a live process.
+    pub fn rewrite(&self, real: u64) -> u64 {
+        match *self {
+            ReturnOp::Force { value } => value,
+            ReturnOp::InvertBool => (real == 0) as u64,
+        }
+    }
+}
+
+/// A function in the target to detour so maycord can rewrite what it returns,
+/// after its real body has run. Pinned to the function entry by exact bytes, like
+/// an [`EventSite`]; the [`ReturnOp`] says how to transform the result.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReturnSite {
+    /// A label for logs (e.g. `"is-telemetry-enabled"`).
+    pub token: String,
+    /// Image-relative address of the function's entry instruction.
+    pub image_offset: u64,
+    /// The exact bytes expected there; the loader refuses to detour on mismatch.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// How to transform the return value on the way out.
+    pub op: ReturnOp,
+    /// Optional signature to relocate this entry when the build has drifted. When
+    /// absent, the entry is pinned only to its exact `image_offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+}
+
+impl ReturnSite {
+    /// The runtime address of the function entry given the image's load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
+}
+
 /// A spot to overwrite with new bytes of the same length: a verified in-place
 /// patch. Where a [`PaletteSite`] writes a colour the renderer reads and an
 /// [`EventSite`] detours a call, this simply replaces the bytes, which covers
@@ -296,6 +352,10 @@ pub struct TargetAdapter {
     /// Functions to detour into plugin events. Empty for theme-only adapters.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<EventSite>,
+    /// Functions whose return value to rewrite after they run (Vencord `after`).
+    /// Empty unless the adapter overrides a return.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub returns: Vec<ReturnSite>,
     /// Same-length byte overwrites: inject UI text, neutralise a function. Empty
     /// unless the adapter patches bytes directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -307,7 +367,11 @@ impl TargetAdapter {
     /// two sites claim the same token. Call this once when loading an adapter,
     /// before trusting [`site`](Self::site) or [`supports`](Self::supports).
     pub fn validate(&self) -> Result<(), VerifyError> {
-        if self.sites.is_empty() && self.events.is_empty() && self.patches.is_empty() {
+        if self.sites.is_empty()
+            && self.events.is_empty()
+            && self.patches.is_empty()
+            && self.returns.is_empty()
+        {
             return Err(VerifyError::NoSites);
         }
         for (i, site) in self.sites.iter().enumerate() {
@@ -422,6 +486,7 @@ mod tests {
                 signature: None,
             }],
             events: vec![],
+            returns: vec![],
             patches: vec![],
         }
     }
@@ -491,6 +556,35 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
         assert_eq!(a.events[0].runtime_addr(0x1_0000_0000), 0x1_0000_4000);
+    }
+
+    #[test]
+    fn a_return_site_round_trips_and_its_op_rewrites() {
+        let mut a = adapter();
+        a.returns = vec![
+            ReturnSite {
+                token: "telemetry-enabled".into(),
+                image_offset: 0x8000,
+                expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
+                op: ReturnOp::InvertBool,
+                signature: None,
+            },
+            ReturnSite {
+                token: "premium".into(),
+                image_offset: 0x9000,
+                expected_bytes: vec![0x1f, 0x20, 0x03, 0xd5],
+                op: ReturnOp::Force { value: 1 },
+                signature: None,
+            },
+        ];
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
+        assert_eq!(a.returns[0].runtime_addr(0x1_0000_0000), 0x1_0000_8000);
+        // InvertBool flips a real boolean; Force ignores the real value.
+        assert_eq!(ReturnOp::InvertBool.rewrite(0), 1);
+        assert_eq!(ReturnOp::InvertBool.rewrite(1), 0);
+        assert_eq!(ReturnOp::InvertBool.rewrite(0x11223344), 0);
+        assert_eq!(ReturnOp::Force { value: 7 }.rewrite(0x11223344), 7);
     }
 
     #[test]

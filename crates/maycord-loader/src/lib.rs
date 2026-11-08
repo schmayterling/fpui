@@ -552,6 +552,7 @@ mod tests {
             },
             sites,
             events: vec![],
+            returns: vec![],
             patches: vec![],
         }
     }
