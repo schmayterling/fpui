@@ -23,6 +23,8 @@
 use maycord_target::{ColorEncoding, TargetAdapter, ValueLocation, VerifyError};
 use maycord_theme::{Rgba, Variant};
 
+pub mod agent;
+
 /// A color encoded the way a specific [`PaletteSite`](maycord_target::PaletteSite)
 /// expects to find it in memory.
 #[derive(Clone, Copy, Debug, PartialEq)]

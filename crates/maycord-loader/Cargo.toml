@@ -4,15 +4,22 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The authorized-target loader: identity-gated launch and palette-write planning for patching a verified GPUI build. The one maycord crate allowed to use unsafe."
+description = "The authorized-target loader: identity-gated launch, palette-write planning, and the in-process agent for patching a verified GPUI build. The one maycord crate allowed to use unsafe."
 
 [dependencies]
 maycord-target.workspace = true
 maycord-theme.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 
 # This crate is the deliberate exception to the workspace-wide `unsafe_code =
-# forbid`: the in-process agent must write a live register/memory slot. It opts
-# out of the workspace lint set and allows unsafe locally, keeping that boundary
-# visible and contained to this one crate.
+# forbid`: the in-process agent must read the live image and write a verified
+# register/memory slot. It opts out of the workspace lint set and allows unsafe
+# locally, keeping that boundary visible and contained to this one crate.
 [lints.rust]
 unsafe_code = "allow"
+
+[dev-dependencies]
+maycord-manifest.workspace = true
