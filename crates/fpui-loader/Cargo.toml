@@ -1,0 +1,36 @@
+[package]
+name = "fpui-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The authorized-target loader and in-process agent: identity-gated launch, palette-write planning, color writes, and hosting sandboxed wasm plugins inside a verified GPUI build. The one fpui crate allowed to use unsafe."
+
+[dependencies]
+fpui-target.workspace = true
+fpui-theme.workspace = true
+fpui-host.workspace = true
+fpui-wasm.workspace = true
+fpui-manifest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+object.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+frida-gum = { version = "0.17.2", optional = true, features = ["auto-download", "invocation-listener"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# This crate is the deliberate exception to the workspace-wide `unsafe_code =
+# forbid`: the in-process agent must read the live image and write a verified
+# register/memory slot. It opts out of the workspace lint set and allows unsafe
+# locally, keeping that boundary visible and contained to this one crate.
+[lints.rust]
+unsafe_code = "allow"
+
+[dev-dependencies]
+wat = "1"
+
+[features]
+frida = ["dep:frida-gum"]

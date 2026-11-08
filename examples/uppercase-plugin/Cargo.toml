@@ -8,7 +8,7 @@ license = "GPL-3.0-or-later"
 crate-type = ["cdylib"]
 
 [dependencies]
-maycord-plugin-sdk = { path = "../../crates/maycord-plugin-sdk" }
+fpui-plugin-sdk = { path = "../../crates/fpui-plugin-sdk" }
 
 # Standalone so the main workspace doesn't build this wasm-targeted crate for the host.
 [workspace]

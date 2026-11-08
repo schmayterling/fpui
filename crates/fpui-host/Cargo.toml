@@ -1,0 +1,13 @@
+[package]
+name = "fpui-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The fpui plugin host: a capability-gated hook surface that plugins run against."
+
+[dependencies]
+fpui-manifest.workspace = true
+
+[lints]
+workspace = true

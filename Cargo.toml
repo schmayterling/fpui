@@ -6,19 +6,19 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-authors = ["maycord contributors"]
+authors = ["fpui contributors"]
 rust-version = "1.82"
 
 [workspace.dependencies]
-maycord-manifest = { path = "crates/maycord-manifest" }
-maycord-theme = { path = "crates/maycord-theme" }
-maycord-host = { path = "crates/maycord-host" }
-maycord-target = { path = "crates/maycord-target" }
-maycord-loader = { path = "crates/maycord-loader" }
-maycord-monitor = { path = "crates/maycord-monitor" }
-maycord-agent = { path = "crates/maycord-agent" }
-maycord-wasm = { path = "crates/maycord-wasm" }
-maycord-plugin-sdk = { path = "crates/maycord-plugin-sdk" }
+fpui-manifest = { path = "crates/fpui-manifest" }
+fpui-theme = { path = "crates/fpui-theme" }
+fpui-host = { path = "crates/fpui-host" }
+fpui-target = { path = "crates/fpui-target" }
+fpui-loader = { path = "crates/fpui-loader" }
+fpui-monitor = { path = "crates/fpui-monitor" }
+fpui-agent = { path = "crates/fpui-agent" }
+fpui-wasm = { path = "crates/fpui-wasm" }
+fpui-plugin-sdk = { path = "crates/fpui-plugin-sdk" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

@@ -1,12 +1,12 @@
 {
   "manifest": {
     "api_version": 1,
-    "id": "maycord-ocean",
+    "id": "fpui-ocean",
     "name": "Ocean",
     "version": "1.0.0",
-    "author": "maycord contributors",
+    "author": "fpui contributors",
     "license": "GPL-3.0-or-later",
-    "source": "https://example.invalid/maycord-ocean",
+    "source": "https://example.invalid/fpui-ocean",
     "kind": "theme"
   },
   "theme": {

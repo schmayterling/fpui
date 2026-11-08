@@ -1,0 +1,18 @@
+[package]
+name = "fpui-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Sandboxed WebAssembly plugin host: runs a wasm module as a fpui-host Plugin, fuel-metered and trap-safe."
+
+[dependencies]
+fpui-host.workspace = true
+wasmi = "2.0.0"
+
+[dev-dependencies]
+fpui-manifest.workspace = true
+wat = "1.263.0"
+
+[lints]
+workspace = true

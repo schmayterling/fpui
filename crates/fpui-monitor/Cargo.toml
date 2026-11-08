@@ -1,0 +1,15 @@
+[package]
+name = "fpui-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Check a fpui adapter's patches against any build of a client and report which still hold. Exits non-zero when a patch has broken, so it can watch new releases."
+
+[dependencies]
+fpui-loader.workspace = true
+fpui-target.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

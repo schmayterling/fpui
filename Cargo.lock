@@ -296,6 +296,102 @@ dependencies = [
 ]
 
 [[package]]
+name = "fpui-agent"
+version = "0.1.0"
+dependencies = [
+ "ctor",
+ "fpui-loader",
+]
+
+[[package]]
+name = "fpui-discover"
+version = "0.1.0"
+dependencies = [
+ "fpui-loader",
+ "object",
+]
+
+[[package]]
+name = "fpui-host"
+version = "0.1.0"
+dependencies = [
+ "fpui-manifest",
+]
+
+[[package]]
+name = "fpui-install"
+version = "0.1.0"
+dependencies = [
+ "plist",
+]
+
+[[package]]
+name = "fpui-loader"
+version = "0.1.0"
+dependencies = [
+ "fpui-host",
+ "fpui-manifest",
+ "fpui-target",
+ "fpui-theme",
+ "fpui-wasm",
+ "frida-gum",
+ "libc",
+ "object",
+ "serde",
+ "serde_json",
+ "wat",
+]
+
+[[package]]
+name = "fpui-manifest"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fpui-monitor"
+version = "0.1.0"
+dependencies = [
+ "fpui-loader",
+ "fpui-target",
+ "serde_json",
+]
+
+[[package]]
+name = "fpui-plugin-sdk"
+version = "0.1.0"
+
+[[package]]
+name = "fpui-target"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "fpui-theme"
+version = "0.1.0"
+dependencies = [
+ "fpui-manifest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fpui-wasm"
+version = "0.1.0"
+dependencies = [
+ "fpui-host",
+ "fpui-manifest",
+ "wasmi",
+ "wat",
+]
+
+[[package]]
 name = "frida-build"
 version = "0.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -745,102 +841,6 @@ dependencies = [
  "cc",
  "libc",
  "pkg-config",
-]
-
-[[package]]
-name = "maycord-agent"
-version = "0.1.0"
-dependencies = [
- "ctor",
- "maycord-loader",
-]
-
-[[package]]
-name = "maycord-discover"
-version = "0.1.0"
-dependencies = [
- "maycord-loader",
- "object",
-]
-
-[[package]]
-name = "maycord-host"
-version = "0.1.0"
-dependencies = [
- "maycord-manifest",
-]
-
-[[package]]
-name = "maycord-install"
-version = "0.1.0"
-dependencies = [
- "plist",
-]
-
-[[package]]
-name = "maycord-loader"
-version = "0.1.0"
-dependencies = [
- "frida-gum",
- "libc",
- "maycord-host",
- "maycord-manifest",
- "maycord-target",
- "maycord-theme",
- "maycord-wasm",
- "object",
- "serde",
- "serde_json",
- "wat",
-]
-
-[[package]]
-name = "maycord-manifest"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "maycord-monitor"
-version = "0.1.0"
-dependencies = [
- "maycord-loader",
- "maycord-target",
- "serde_json",
-]
-
-[[package]]
-name = "maycord-plugin-sdk"
-version = "0.1.0"
-
-[[package]]
-name = "maycord-target"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "maycord-theme"
-version = "0.1.0"
-dependencies = [
- "maycord-manifest",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "maycord-wasm"
-version = "0.1.0"
-dependencies = [
- "maycord-host",
- "maycord-manifest",
- "wasmi",
- "wat",
 ]
 
 [[package]]

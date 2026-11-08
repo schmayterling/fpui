@@ -1,0 +1,15 @@
+[package]
+name = "fpui-theme"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Theme package schema and color model for fpui: declarative dark/light token maps."
+
+[dependencies]
+fpui-manifest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

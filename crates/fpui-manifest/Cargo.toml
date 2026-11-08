@@ -1,0 +1,16 @@
+[package]
+name = "fpui-manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Extension manifest and capability schema shared by fpui hosts and packaging tools."
+
+[dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
