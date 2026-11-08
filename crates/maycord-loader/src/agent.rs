@@ -359,10 +359,35 @@ pub fn main_image_base() -> Option<u64> {
     }
 }
 
+/// Where the main executable is loaded, from the dynamic linker's view of the
+/// process: the first object `dl_iterate_phdr` reports is the main executable,
+/// and its load bias is the base. Returns `None` for a non-PIE binary (bias 0),
+/// which this prototype does not yet handle.
+#[cfg(target_os = "linux")]
+pub fn main_image_base() -> Option<u64> {
+    unsafe extern "C" fn first_object(
+        info: *mut libc::dl_phdr_info,
+        _size: libc::size_t,
+        data: *mut libc::c_void,
+    ) -> libc::c_int {
+        // SAFETY: `data` is the `&mut u64` we passed below; store the first
+        // object's load bias and stop the walk by returning non-zero.
+        unsafe { *(data as *mut u64) = (*info).dlpi_addr as u64 };
+        1
+    }
+    let mut base: u64 = 0;
+    // SAFETY: a standard `dl_iterate_phdr` call with a matching callback and the
+    // address of `base` as its data pointer.
+    unsafe {
+        libc::dl_iterate_phdr(Some(first_object), (&mut base as *mut u64).cast());
+    }
+    (base != 0).then_some(base)
+}
+
 /// Run the whole agent once: load the adapter and theme, find the image, build
 /// the plan, verify it, and apply. Called from the agent dylib's startup
 /// constructor.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn run() -> io::Result<()> {
     let adapter = adapter_from_env()?;
     let package = theme_from_env()?;
@@ -371,7 +396,16 @@ pub fn run() -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "main executable image not found"))?;
     let plan = plan_writes(&adapter, variant, base);
     verify_sites(&plan).map_err(invalid)?;
-    apply(&plan)?;
+    // A build without the write backend (e.g. no `frida`) still injects and
+    // verifies; it just can't apply. Report that and carry on to plugin hosting
+    // rather than aborting.
+    if let Err(e) = apply(&plan) {
+        if e.kind() == io::ErrorKind::Unsupported {
+            eprintln!("maycord: {e}");
+        } else {
+            return Err(e);
+        }
+    }
 
     // If plugins are configured, host them on their own thread and feed them
     // events detoured from the target (a received message, ...). The plugin
@@ -380,7 +414,7 @@ pub fn run() -> io::Result<()> {
         let config = std::fs::read_to_string(path)?;
         let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
         std::thread::spawn(move || plugin_consumer(config, rx));
-        #[cfg(feature = "frida")]
+        #[cfg(all(target_os = "macos", feature = "frida"))]
         if !adapter.events.is_empty() {
             if let Err(e) = frida_backend::attach_events(&adapter, base, tx.clone()) {
                 eprintln!("maycord: event detour failed: {e}");

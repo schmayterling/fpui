@@ -179,6 +179,28 @@ pub fn launch_macos(
         .spawn()
 }
 
+/// Linux launch (prototype): check the target on disk, then start it with the
+/// agent shared object forced in via `LD_PRELOAD` and the adapter passed by path.
+///
+/// Like the macOS path, this works on an ordinary dynamically-linked binary; a
+/// secure-execution binary (setuid, or `AT_SECURE`) ignores `LD_PRELOAD`, which
+/// the loader surfaces rather than pretending to inject.
+#[cfg(target_os = "linux")]
+pub fn launch_linux(
+    exe: &std::path::Path,
+    agent_so: &std::path::Path,
+    adapter: &TargetAdapter,
+    adapter_path: &std::path::Path,
+) -> std::io::Result<std::process::Child> {
+    let bytes = std::fs::read(exe)?;
+    preflight(&bytes, adapter)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    std::process::Command::new(exe)
+        .env("LD_PRELOAD", agent_so)
+        .env("MAYCORD_ADAPTER", adapter_path)
+        .spawn()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

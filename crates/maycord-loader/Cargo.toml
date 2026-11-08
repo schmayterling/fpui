@@ -17,6 +17,8 @@ serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 frida-gum = { version = "0.17.2", optional = true, features = ["auto-download", "invocation-listener"] }
+
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # This crate is the deliberate exception to the workspace-wide `unsafe_code =
