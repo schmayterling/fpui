@@ -497,6 +497,71 @@ pub struct TargetAdapter {
     /// unless the adapter patches bytes directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub patches: Vec<BytePatchSite>,
+    /// Elements to append to a Vec the target returns (e.g. a new settings
+    /// category the app then lays out and routes). Empty unless the adapter adds
+    /// a list entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub appends: Vec<ListAppendSite>,
+}
+
+/// How one field of an appended element is filled in at load time — the real
+/// addresses of our own data (and of functions we reuse) aren't known until the
+/// agent is inside the target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ElementFixup {
+    /// Write, at `offset` bytes into the element, a pointer to `bytes` — a static
+    /// blob the agent owns for the process lifetime (a `&'static str`'s data).
+    StaticBlob {
+        offset: u64,
+        #[serde(with = "hex_bytes")]
+        bytes: Vec<u8>,
+    },
+    /// Write, at `offset`, the runtime address of a target function found by
+    /// `anchor` — e.g. the app's own empty-render fn, reused so no foreign code
+    /// is introduced into the target.
+    TargetFn { offset: u64, anchor: StringAnchor },
+}
+
+/// Append one element to a `Vec<T>` a target function returns. Where the detour
+/// sites change a call's behaviour, this grows the target's own `Vec` and writes
+/// one more `T`, so the app lays out and routes the new entry natively (a settings
+/// category, a list row). The `element` is the raw bytes of the app's own struct
+/// with its pointer fields blank; `fixups` fill them with data we own or functions
+/// the app already has — so no foreign object is constructed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListAppendSite {
+    /// A label for logs (e.g. `"settings-category"`).
+    pub token: String,
+    /// Image-relative entry of the function that returns the `Vec`.
+    pub image_offset: u64,
+    /// The exact bytes expected there; the loader refuses to detour on mismatch.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// Which of the three words of the `Vec` header holds the buffer pointer. Rust
+    /// doesn't guarantee `Vec`'s field order, so the adapter names it.
+    pub ptr_word: u8,
+    /// The raw bytes of the element to append (one `T`), pointer fields left as
+    /// placeholders that `fixups` fill in.
+    #[serde(with = "hex_bytes")]
+    pub element: Vec<u8>,
+    /// How to fill the element's pointer fields once real addresses are known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixups: Vec<ElementFixup>,
+    /// Optional signature to relocate the entry when the build has drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+    /// Optional string anchor to re-find the entry when the build has drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StringAnchor>,
+}
+
+impl ListAppendSite {
+    /// The runtime address of the Vec-returning function given the load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
 }
 
 impl TargetAdapter {
@@ -510,6 +575,7 @@ impl TargetAdapter {
             && self.returns.is_empty()
             && self.args.is_empty()
             && self.replaces.is_empty()
+            && self.appends.is_empty()
         {
             return Err(VerifyError::NoSites);
         }
@@ -644,6 +710,7 @@ mod tests {
             args: vec![],
             replaces: vec![],
             patches: vec![],
+            appends: vec![],
         }
     }
 
@@ -801,6 +868,35 @@ mod tests {
         assert!(unhex("€0").is_err());
         assert!(unhex("zz").is_err());
         assert_eq!(unhex("1f2003d5").unwrap(), vec![0x1f, 0x20, 0x03, 0xd5]);
+    }
+
+    #[test]
+    fn a_list_append_site_round_trips() {
+        let mut a = adapter();
+        a.appends = vec![ListAppendSite {
+            token: "settings-category".into(),
+            image_offset: 0x4ef76dc,
+            expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
+            ptr_word: 1,
+            element: vec![0; 32],
+            fixups: vec![
+                ElementFixup::StaticBlob { offset: 0, bytes: b"fpui".to_vec() },
+                ElementFixup::TargetFn {
+                    offset: 24,
+                    anchor: StringAnchor { text: "render_empty".into() },
+                },
+            ],
+            signature: None,
+            anchor: None,
+        }];
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
+        assert_eq!(a.appends[0].runtime_addr(0x1_0000_0000), 0x1_04ef_76dc);
+        // The NoSites guard counts appends.
+        let mut only = adapter();
+        only.sites.clear();
+        only.appends = a.appends.clone();
+        assert!(only.validate().is_ok());
     }
 
     #[test]
