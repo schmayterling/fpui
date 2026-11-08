@@ -10,9 +10,20 @@ description = "Sandboxed WebAssembly plugin host: runs a wasm module as a fpui-h
 fpui-host.workspace = true
 wasmi = "2.0.0"
 
+[features]
+# JavaScript plugins via Javy (QuickJS compiled to wasm). Off by default so the
+# plain-wasm host stays lean; it turns on wasmi's `simd` support, which the
+# QuickJS-wasm engine needs to run under the interpreter.
+js = ["wasmi/simd"]
+
 [dev-dependencies]
 fpui-manifest.workspace = true
 wat = "1.263.0"
+
+# Runs a Javy-compiled JS plugin; needs the `js` backend it drives.
+[[example]]
+name = "run_js"
+required-features = ["js"]
 
 [lints]
 workspace = true
