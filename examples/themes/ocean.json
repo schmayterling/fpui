@@ -1,0 +1,42 @@
+{
+  "manifest": {
+    "api_version": 1,
+    "id": "maycord-ocean",
+    "name": "Ocean",
+    "version": "1.0.0",
+    "author": "maycord contributors",
+    "license": "GPL-3.0-or-later",
+    "source": "https://example.invalid/maycord-ocean",
+    "kind": "theme"
+  },
+  "theme": {
+    "dark": {
+      "colors": {
+        "background": "#101C28",
+        "surface": "#192C3C",
+        "sidebar": "#142432",
+        "overlay": "#20384A",
+        "border": "#3B576B",
+        "text": "#E8F4F8",
+        "muted": "#8FA9B8",
+        "accent": "#57CEE3",
+        "accent_text": "#10202B",
+        "link": "#8DE6F2"
+      }
+    },
+    "light": {
+      "colors": {
+        "background": "#F4FAFC",
+        "surface": "#FFFFFF",
+        "sidebar": "#E4EEF2",
+        "overlay": "#FFFFFF",
+        "border": "#C4D6DE",
+        "text": "#10202B",
+        "muted": "#52707E",
+        "accent": "#0E7C96",
+        "accent_text": "#FFFFFF",
+        "link": "#0E7C96"
+      }
+    }
+  }
+}

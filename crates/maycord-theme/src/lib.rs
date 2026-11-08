@@ -225,4 +225,13 @@ mod tests {
         let out = serde_json::to_vec(&pkg).unwrap();
         assert_eq!(parse_package(&out).unwrap(), pkg);
     }
+
+    #[test]
+    fn the_shipped_example_theme_is_valid_and_complete() {
+        let json = include_str!("../../../examples/themes/ocean.json");
+        let pkg = parse_package(json.as_bytes()).unwrap();
+        // Both variants present, and dark covers the whole reference UI.
+        assert!(pkg.theme.light.is_some());
+        assert!(pkg.theme.dark.unwrap().missing_core_tokens().is_empty());
+    }
 }
