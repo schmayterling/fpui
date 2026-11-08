@@ -5,9 +5,8 @@
 //!
 //! Everything here up to [`apply`] is verification: it reads, compares, and
 //! refuses, so it is safe to run even against the wrong process. [`apply`] is
-//! the only step that rewrites the target's execution; its backend (a frida-gum
-//! instruction probe) and the per-build site offsets are the remaining work,
-//! tracked in `the maycord research notes`.
+//! the only step that rewrites the target's execution, via a frida-gum
+//! instruction probe behind the `frida` feature.
 
 use std::io;
 
