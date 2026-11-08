@@ -121,44 +121,72 @@ mod frida_backend {
 
     use crate::{EncodedColor, PlannedWrite};
 
+    /// What a probe does when it fires at a site.
+    enum Action {
+        /// Put `value` into general register `reg` (for a `u32` color in a reg).
+        SetReg { reg: usize, value: u64 },
+        /// Write `bytes` into memory at `[general_register[base] + offset]` — for
+        /// a color that lives in a struct or on the heap, the usual GPUI case.
+        WriteMem { base: usize, offset: i64, bytes: Vec<u8> },
+    }
+
     /// A probe tied to one site: when execution reaches the pinned instruction,
-    /// it overwrites the color register before that instruction runs.
+    /// it performs its [`Action`] before that instruction runs.
     struct ColorProbe {
-        reg: usize,
-        value: u64,
+        action: Action,
     }
 
     impl ProbeListener for ColorProbe {
         fn on_hit(&mut self, context: InvocationContext) {
             let mut cpu = context.cpu_context();
-            // apply() already checked this site, so the context is writable and
-            // the register number is in range.
-            if cpu.set_reg(self.reg, self.value).is_err() {
-                debug_assert!(false, "probe cpu context was unexpectedly read-only");
+            match &self.action {
+                // apply() already checked the register is in range and that the
+                // context is writable.
+                Action::SetReg { reg, value } => {
+                    if cpu.set_reg(*reg, *value).is_err() {
+                        debug_assert!(false, "probe cpu context was unexpectedly read-only");
+                    }
+                }
+                Action::WriteMem { base, offset, bytes } => {
+                    let addr = cpu.reg(*base).wrapping_add_signed(*offset);
+                    // SAFETY: `addr` is a live base register the target itself
+                    // uses to reach this color, plus a fixed offset from a
+                    // verified site. We write exactly the encoded color's bytes
+                    // into the target's own writable color slot.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
+                    }
+                }
             }
         }
     }
 
-    /// What this backend can write today: a packed `u32` color into a general
-    /// register `x0..x28`. Vector-register (`f32x4`) and stack writes can be
-    /// described in an adapter but aren't done here yet; such a site is rejected
-    /// up front instead of attached to and quietly ignored.
+    /// What this backend can write today: a `u32` color into a general register
+    /// `x0..x28`, or any encoded color into memory at `[x0..x28 + offset]`
+    /// ([`Indirect`](ValueLocation::Indirect)) — which covers GPUI's HSLA colors
+    /// in their `Quad` struct or theme global. Writing a vector register directly
+    /// isn't reachable through frida's safe API yet; such a site is rejected up
+    /// front instead of attached to and quietly ignored.
     fn probe_for(write: &PlannedWrite) -> io::Result<ColorProbe> {
-        match (write.location, write.color) {
+        let action = match (write.location, write.color) {
             (ValueLocation::General(n), EncodedColor::U32(word)) if (n as usize) < 29 => {
-                Ok(ColorProbe {
-                    reg: n as usize,
-                    value: word as u64,
-                })
+                Action::SetReg { reg: n as usize, value: word as u64 }
             }
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!(
-                    "site `{}`: this backend writes only a srgb_u32 color into x0..x28 so far",
-                    write.token
-                ),
-            )),
-        }
+            (ValueLocation::Indirect { base, offset }, color) if (base as usize) < 29 => {
+                Action::WriteMem {
+                    base: base as usize,
+                    offset,
+                    bytes: color.to_le_bytes(),
+                }
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("site `{}`: unsupported location or encoding for this backend", write.token),
+                ))
+            }
+        };
+        Ok(ColorProbe { action })
     }
 
     pub fn apply(plan: &[PlannedWrite]) -> io::Result<()> {

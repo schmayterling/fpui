@@ -59,6 +59,10 @@ pub enum ColorEncoding {
     PremultipliedLinearF32,
     /// A single `0xRRGGBBAA` word.
     SrgbU32,
+    /// Four straight-alpha HSLA `f32` channels, `0.0..=1.0` (hue, saturation,
+    /// lightness, alpha) — the form GPUI stores a color in. maycord converts a
+    /// hex color to this the same way GPUI's `From<Rgba> for Hsla` does.
+    StraightHslaF32,
 }
 
 /// Where the color sits when execution reaches a [`PaletteSite`]. Register
@@ -73,6 +77,11 @@ pub enum ValueLocation {
     Vector(u8),
     /// A slot at `offset` bytes from the stack pointer at the site.
     Stack { offset: i64 },
+    /// The color sits in memory at `[general_register[base] + offset]`: read the
+    /// base register, add the offset, and write the color there. This is how
+    /// GPUI colors are reached in practice — inside a struct like `Quad`, or in
+    /// the theme global's heap data.
+    Indirect { base: u8, offset: i64 },
 }
 
 /// One spot in a specific build where a color is built, plus everything the

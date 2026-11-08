@@ -70,8 +70,44 @@ pub fn encode_color(color: Rgba, encoding: ColorEncoding) -> Option<EncodedColor
                 | (color.b as u32) << 8
                 | color.a as u32,
         ),
+        ColorEncoding::StraightHslaF32 => EncodedColor::F32x4(to_straight_hsla(color)),
         _ => return None,
     })
+}
+
+/// Convert a color to GPUI's HSLA form: hue, saturation, lightness, alpha, each
+/// `0.0..=1.0`. This mirrors GPUI's own `From<Rgba> for Hsla` exactly (it works
+/// on straight sRGB channels, not linear), so a color maycord writes into a GPUI
+/// build matches what GPUI would have computed itself.
+fn to_straight_hsla(color: Rgba) -> [f32; 4] {
+    let r = color.r as f32 / 255.0;
+    let g = color.g as f32 / 255.0;
+    let b = color.b as f32 / 255.0;
+    let a = color.a as f32 / 255.0;
+
+    let max = r.max(g.max(b));
+    let min = r.min(g.min(b));
+    let delta = max - min;
+
+    let l = (max + min) / 2.0;
+    let s = if l == 0.0 || l == 1.0 {
+        0.0
+    } else if l < 0.5 {
+        delta / (2.0 * l)
+    } else {
+        delta / (2.0 - 2.0 * l)
+    };
+    let h = if delta == 0.0 {
+        0.0
+    } else if max == r {
+        ((g - b) / delta).rem_euclid(6.0) / 6.0
+    } else if max == g {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+
+    [h, s, l, a]
 }
 
 /// One write the agent will make: at `runtime_addr`, after checking
@@ -211,6 +247,25 @@ mod tests {
         let bytes = EncodedColor::F32x4([1.0, 0.0, 0.0, 1.0]).to_le_bytes();
         assert_eq!(bytes.len(), 16);
         assert_eq!(&bytes[0..4], &1.0f32.to_le_bytes());
+    }
+
+    #[test]
+    fn straight_hsla_matches_gpuis_formula() {
+        // #3366cc, converted the way GPUI's own `From<Rgba> for Hsla` would.
+        match encode_color(Rgba::rgb(0x33, 0x66, 0xcc), ColorEncoding::StraightHslaF32) {
+            Some(EncodedColor::F32x4([h, s, l, a])) => {
+                assert!((h - 0.611_111).abs() < 1e-5, "h = {h}");
+                assert!((s - 0.6).abs() < 1e-5, "s = {s}");
+                assert!((l - 0.5).abs() < 1e-5, "l = {l}");
+                assert_eq!(a, 1.0);
+            }
+            other => panic!("expected an hsla f32x4, got {other:?}"),
+        }
+        // A grey has zero saturation and hue.
+        assert_eq!(
+            encode_color(Rgba::rgb(128, 128, 128), ColorEncoding::StraightHslaF32),
+            Some(EncodedColor::F32x4([0.0, 0.0, 128.0 / 255.0, 1.0]))
+        );
     }
 
     #[test]
