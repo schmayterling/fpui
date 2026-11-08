@@ -19,7 +19,7 @@
 
 use std::process::ExitCode;
 
-use maycord_loader::extract_signature_across;
+use maycord_loader::{extract_signature_across, force_return_aarch64};
 use object::{Object, ObjectSection, ObjectSymbol};
 
 fn main() -> ExitCode {
@@ -32,9 +32,8 @@ fn main() -> ExitCode {
                 continue;
             }
             match a.as_str() {
-                "--symbol" | "--offset" | "--token" | "--len" | "--max-radius" | "--also" => {
-                    skip = true
-                }
+                "--symbol" | "--offset" | "--token" | "--len" | "--max-radius" | "--also"
+                | "--force-return" => skip = true,
                 s if s.starts_with("--") => {}
                 _ => out.push(a),
             }
@@ -51,7 +50,15 @@ fn main() -> ExitCode {
     };
 
     let token = flag(&args, "--token").unwrap_or("token");
-    let len: usize = flag(&args, "--len").map_or(Ok(4), str::parse).unwrap_or(4);
+    // `--force-return <v>` emits a byte patch that overwrites the function entry
+    // with `mov w0, #v; ret`, forcing it to return `v` (maycord's "make it
+    // return true/false" patch). That patch is exactly eight bytes.
+    let force_return: Option<u16> = flag(&args, "--force-return").and_then(|s| s.parse().ok());
+    let len: usize = if force_return.is_some() {
+        8
+    } else {
+        flag(&args, "--len").map_or(Ok(4), str::parse).unwrap_or(4)
+    };
     let max_radius: usize = flag(&args, "--max-radius")
         .map_or(Ok(64), str::parse)
         .unwrap_or(64);
@@ -101,8 +108,12 @@ fn main() -> ExitCode {
                 sig.site_offset,
                 images.len()
             );
+            let replacement = match force_return {
+                Some(v) => format!(r#","replacement_bytes":"{}""#, hex(&force_return_aarch64(v))),
+                None => String::new(),
+            };
             println!(
-                "{{\"token\":{token:?},\"image_offset\":{site},\"expected_bytes\":\"{}\",\
+                "{{\"token\":{token:?},\"image_offset\":{site},\"expected_bytes\":\"{}\"{replacement},\
                  \"signature\":{{\"bytes\":\"{}\",\"site_offset\":{}}}}}",
                 hex(&expected),
                 hex(&sig.bytes),

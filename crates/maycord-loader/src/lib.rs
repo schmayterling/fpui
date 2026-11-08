@@ -352,6 +352,22 @@ pub fn extract_signature_across(
     None
 }
 
+/// Encode `mov w0, #value; ret` for aarch64: eight bytes that make a function
+/// return `value` immediately and ignore its body. This is maycord's form of the
+/// most common Vencord patch, forcing a check to a constant (e.g. make a guard
+/// return true or false). It is applied as a byte patch over the function entry;
+/// because it never touches the stack pointer, returning straight away leaves the
+/// caller's frame intact.
+pub fn force_return_aarch64(value: u16) -> [u8; 8] {
+    // MOVZ w0, #value  =>  0x52800000 | (value << 5)
+    let movz: u32 = 0x5280_0000 | ((value as u32) << 5);
+    const RET: u32 = 0xd65f_03c0;
+    let mut out = [0u8; 8];
+    out[0..4].copy_from_slice(&movz.to_le_bytes());
+    out[4..8].copy_from_slice(&RET.to_le_bytes());
+    out
+}
+
 fn event_label(event: &EventKind) -> String {
     match event {
         EventKind::MessageReceived { .. } => "message_received".to_string(),
@@ -762,6 +778,20 @@ mod tests {
         assert_eq!(occurrences(&a, &cross.bytes), 1);
         assert_eq!(occurrences(&b, &cross.bytes), 1);
         assert!(cross.bytes.len() > EXPECT.len());
+    }
+
+    #[test]
+    fn force_return_encodes_movz_then_ret() {
+        // mov w0, #1 ; ret
+        assert_eq!(
+            force_return_aarch64(1),
+            [0x20, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6]
+        );
+        // mov w0, #0 ; ret
+        assert_eq!(
+            force_return_aarch64(0),
+            [0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6]
+        );
     }
 
     #[test]
