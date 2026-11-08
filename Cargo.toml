@@ -16,6 +16,7 @@ maycord-host = { path = "crates/maycord-host" }
 maycord-target = { path = "crates/maycord-target" }
 maycord-loader = { path = "crates/maycord-loader" }
 maycord-agent = { path = "crates/maycord-agent" }
+maycord-wasm = { path = "crates/maycord-wasm" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
