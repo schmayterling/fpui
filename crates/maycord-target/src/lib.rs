@@ -229,7 +229,7 @@ impl TargetAdapter {
     /// two sites claim the same token. Call this once when loading an adapter,
     /// before trusting [`site`](Self::site) or [`supports`](Self::supports).
     pub fn validate(&self) -> Result<(), VerifyError> {
-        if self.sites.is_empty() {
+        if self.sites.is_empty() && self.events.is_empty() {
             return Err(VerifyError::NoSites);
         }
         for (i, site) in self.sites.iter().enumerate() {

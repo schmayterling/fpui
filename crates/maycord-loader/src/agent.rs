@@ -58,6 +58,25 @@ pub fn load_plugins(config: &str) -> io::Result<Host> {
     Ok(host)
 }
 
+/// Own the hosted plugins on a dedicated thread: ready them, then run each
+/// detoured message through their message hook and let them observe the arrival.
+/// Keeping this off the detour's hot path is why wasm never runs inside a probe.
+fn plugin_consumer(config: String, rx: std::sync::mpsc::Receiver<(String, String)>) {
+    let mut host = match load_plugins(&config) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("maycord: could not load plugins: {e}");
+            return;
+        }
+    };
+    host.broadcast(&maycord_host::Event::Ready);
+    for (author, text) in rx {
+        let processed = host.render_message(&author, &text);
+        host.broadcast(&maycord_host::Event::MessageDisplayed { author: author.clone() });
+        eprintln!("maycord: plugin saw message from {author}: {processed}");
+    }
+}
+
 /// Read and validate the adapter the loader passed by path in `MAYCORD_ADAPTER`.
 pub fn adapter_from_env() -> io::Result<TargetAdapter> {
     let path = std::env::var_os("MAYCORD_ADAPTER")
@@ -153,9 +172,11 @@ pub fn apply(_plan: &[PlannedWrite]) -> io::Result<()> {
 mod frida_backend {
     use std::io;
 
+    use std::sync::mpsc::Sender;
+
     use frida_gum::interceptor::{InvocationContext, Interceptor, ProbeListener};
     use frida_gum::{Gum, NativePointer};
-    use maycord_target::ValueLocation;
+    use maycord_target::{EventKind, StringArg, TargetAdapter, ValueLocation};
 
     use crate::{EncodedColor, PlannedWrite};
 
@@ -246,6 +267,69 @@ mod frida_backend {
         Box::leak(Box::new((gum, interceptor)));
         Ok(())
     }
+
+    /// A probe at a detoured function's entry: it copies the message's author and
+    /// text out of the call's arguments and queues them for the plugin thread. No
+    /// wasm or heavy work runs here, per the no-blocking-in-callback rule.
+    struct MessageProbe {
+        author: StringArg,
+        text: StringArg,
+        tx: Sender<(String, String)>,
+    }
+
+    impl ProbeListener for MessageProbe {
+        fn on_hit(&mut self, context: InvocationContext) {
+            let read = |arg: StringArg| -> Option<String> {
+                let ptr = context.arg(arg.ptr_arg as u32);
+                let len = context.arg(arg.len_arg as u32);
+                if ptr == 0 || len > 64 * 1024 {
+                    return None;
+                }
+                // SAFETY: the target passed (ptr, len) as a string argument; we
+                // read exactly `len` bytes (capped above) and never write.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+                Some(String::from_utf8_lossy(bytes).into_owned())
+            };
+            if let (Some(author), Some(text)) = (read(self.author), read(self.text)) {
+                let _ = self.tx.send((author, text));
+            }
+        }
+    }
+
+    /// Detour each of the adapter's event sites — checking its pinned bytes first
+    /// — and wire hits to `tx` so they reach the plugin thread.
+    pub fn attach_events(
+        adapter: &TargetAdapter,
+        image_base: u64,
+        tx: Sender<(String, String)>,
+    ) -> io::Result<()> {
+        let gum = Gum::obtain();
+        let mut interceptor = Interceptor::obtain(&gum);
+        for site in &adapter.events {
+            let addr = site.runtime_addr(image_base);
+            // SAFETY: read-only check of the pinned bytes at the resolved entry.
+            let actual =
+                unsafe { std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len()) };
+            if actual != site.expected_bytes.as_slice() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("event site at {addr:#x} does not hold its pinned bytes"),
+                ));
+            }
+            match site.event {
+                EventKind::MessageReceived { author, text } => {
+                    let probe = Box::leak(Box::new(MessageProbe { author, text, tx: tx.clone() }));
+                    let np = NativePointer(addr as *mut core::ffi::c_void);
+                    interceptor.attach_instruction(np, probe).map_err(|e| {
+                        io::Error::other(format!("attach event at {addr:#x}: {e:?}"))
+                    })?;
+                }
+                _ => {}
+            }
+        }
+        Box::leak(Box::new((gum, interceptor)));
+        Ok(())
+    }
 }
 
 /// Where the main executable is loaded in memory (its preferred base plus the
@@ -289,15 +373,22 @@ pub fn run() -> io::Result<()> {
     verify_sites(&plan).map_err(invalid)?;
     apply(&plan)?;
 
-    // If plugins are configured, host them in-process and announce readiness.
-    // Delivering backend events (a received message, ...) to these hooks is the
-    // next step; today the agent just loads and readies them.
+    // If plugins are configured, host them on their own thread and feed them
+    // events detoured from the target (a received message, ...). The plugin
+    // thread owns the host, so wasm never runs on the detour's hot path.
     if let Some(path) = std::env::var_os("MAYCORD_PLUGINS") {
         let config = std::fs::read_to_string(path)?;
-        let mut host = load_plugins(&config)?;
-        host.broadcast(&maycord_host::Event::Ready);
-        // Keep the host and its plugins alive for the process lifetime.
-        Box::leak(Box::new(host));
+        let (tx, rx) = std::sync::mpsc::channel::<(String, String)>();
+        std::thread::spawn(move || plugin_consumer(config, rx));
+        #[cfg(feature = "frida")]
+        if !adapter.events.is_empty() {
+            if let Err(e) = frida_backend::attach_events(&adapter, base, tx.clone()) {
+                eprintln!("maycord: event detour failed: {e}");
+            }
+        }
+        // The consumer runs for the process lifetime while an event probe holds a
+        // sender; with no probes it readies the plugins and then idles.
+        drop(tx);
     }
     Ok(())
 }
