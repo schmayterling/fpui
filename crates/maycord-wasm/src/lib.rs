@@ -26,7 +26,7 @@
 //! The host allocates the input with `maycord_alloc`, writes it, calls the
 //! transform, and reads the result back out of the guest's memory.
 
-use maycord_host::{Message, Plugin};
+use maycord_host::{Draft, Message, Plugin};
 use wasmi::{Config, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 /// Fuel spent per hook call before the guest is trapped. Generous for a text
@@ -67,6 +67,7 @@ pub struct WasmPlugin {
     memory: Memory,
     alloc: Option<TypedFunc<i32, i32>>,
     transform_message: Option<TypedFunc<(i32, i32), i64>>,
+    transform_draft: Option<TypedFunc<(i32, i32), i64>>,
     fuel_per_call: u64,
 }
 
@@ -99,20 +100,24 @@ impl WasmPlugin {
         let transform_message = instance
             .get_typed_func::<(i32, i32), i64>(&store, "maycord_transform_message")
             .ok();
+        let transform_draft = instance
+            .get_typed_func::<(i32, i32), i64>(&store, "maycord_transform_draft")
+            .ok();
 
         Ok(Self {
             store,
             memory,
             alloc,
             transform_message,
+            transform_draft,
             fuel_per_call,
         })
     }
 
     /// Run the guest transform over `input`. Returns `None` on any trap,
     /// out-of-fuel, or protocol error, so the caller keeps the original text.
-    fn run_transform(&mut self, input: &str) -> Option<String> {
-        let (alloc, transform) = (self.alloc?, self.transform_message?);
+    fn run_transform(&mut self, func: TypedFunc<(i32, i32), i64>, input: &str) -> Option<String> {
+        let alloc = self.alloc?;
         let memory = self.memory;
 
         // Fresh budget for this call.
@@ -127,7 +132,7 @@ impl WasmPlugin {
         }
         memory.write(&mut self.store, in_ptr as usize, bytes).ok()?;
 
-        let packed = transform.call(&mut self.store, (in_ptr, len)).ok()? as u64;
+        let packed = func.call(&mut self.store, (in_ptr, len)).ok()? as u64;
         let out_ptr = (packed >> 32) as usize;
         let out_len = (packed & 0xffff_ffff) as usize;
         if out_len > MAX_OUTPUT {
@@ -142,13 +147,22 @@ impl WasmPlugin {
 
 impl Plugin for WasmPlugin {
     fn transform_message(&mut self, message: &mut Message) {
-        if self.transform_message.is_none() {
+        let Some(func) = self.transform_message else {
             return;
-        }
-        if let Some(rewritten) = self.run_transform(&message.content) {
+        };
+        if let Some(rewritten) = self.run_transform(func, &message.content) {
             message.content = rewritten;
         }
         // On None the original content stands: a failed mod changes nothing.
+    }
+
+    fn transform_draft(&mut self, draft: &mut Draft) {
+        let Some(func) = self.transform_draft else {
+            return;
+        };
+        if let Some(rewritten) = self.run_transform(func, &draft.text) {
+            draft.text = rewritten;
+        }
     }
 }
 
@@ -195,6 +209,34 @@ mod tests {
       (func (export "maycord_transform_message") (param i32 i32) (result i64)
         (loop $l (br $l))
         (i64.const 0)))
+    "#;
+
+    // The same ASCII-uppercase guest, but exported as the draft hook.
+    const DRAFT_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (global $heap (mut i32) (i32.const 1024))
+      (func $alloc (export "maycord_alloc") (param $n i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $heap))
+        (global.set $heap (i32.add (global.get $heap) (local.get $n)))
+        (local.get $p))
+      (func (export "maycord_transform_draft") (param $ptr i32) (param $len i32) (result i64)
+        (local $out i32) (local $i i32) (local $b i32)
+        (local.set $out (call $alloc (local.get $len)))
+        (block $done
+          (loop $loop
+            (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+            (local.set $b (i32.load8_u (i32.add (local.get $ptr) (local.get $i))))
+            (if (i32.and (i32.ge_u (local.get $b) (i32.const 97))
+                         (i32.le_u (local.get $b) (i32.const 122)))
+              (then (local.set $b (i32.sub (local.get $b) (i32.const 32)))))
+            (i32.store8 (i32.add (local.get $out) (local.get $i)) (local.get $b))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $loop)))
+        (i64.or
+          (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+          (i64.extend_i32_u (local.get $len)))))
     "#;
 
     fn manifest(caps: &[Capability]) -> Manifest {
@@ -256,5 +298,30 @@ mod tests {
     #[test]
     fn a_non_module_is_rejected() {
         assert!(matches!(WasmPlugin::load(b"not wasm"), Err(WasmError::Compile(_))));
+    }
+
+    #[test]
+    fn transform_draft_rewrites_the_draft() {
+        let wasm = wat::parse_str(DRAFT_WAT).unwrap();
+        let mut plugin = WasmPlugin::load(&wasm).unwrap();
+        let mut d = maycord_host::Draft { text: "ship it".into() };
+        plugin.transform_draft(&mut d);
+        assert_eq!(d.text, "SHIP IT");
+        // This module has no message hook, so a message is left untouched.
+        let mut m = Message { author: "a".into(), content: "quiet".into() };
+        plugin.transform_message(&mut m);
+        assert_eq!(m.content, "quiet");
+    }
+
+    #[test]
+    fn draft_runs_through_the_host_with_composer() {
+        let wasm = wat::parse_str(DRAFT_WAT).unwrap();
+        let plugin = WasmPlugin::load(&wasm).unwrap();
+        let mut host = Host::new();
+        host.register(&manifest(&[Capability::Composer]), &[Capability::Composer], Box::new(plugin))
+            .unwrap();
+        let mut d = maycord_host::Draft { text: "hi".into() };
+        host.edit_draft(&mut d);
+        assert_eq!(d.text, "HI");
     }
 }

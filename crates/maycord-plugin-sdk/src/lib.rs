@@ -51,27 +51,48 @@ pub fn run_transform<F: FnOnce(&str) -> String>(ptr: i32, len: i32, transform: F
     (((out_ptr as u64) << 32) | out_len as u64) as i64
 }
 
-/// Define a maycord plugin. Give it the hooks you want; the macro emits the wasm
-/// exports maycord's host calls.
+/// Define a maycord plugin. List the hooks you want; the macro emits the wasm
+/// exports maycord's host calls. Each hook takes the input `&str` and returns
+/// the rewritten `String`.
+///
+/// Hooks: `transform_message` (an incoming message) and `transform_draft` (the
+/// user's outgoing draft). An unknown hook name is a compile error.
 ///
 /// ```ignore
 /// maycord_plugin_sdk::plugin! {
-///     transform_message: |content: &str| content.to_uppercase(),
+///     transform_message: |content| content.to_uppercase(),
+///     transform_draft: |draft| format!("{draft} — via maycord"),
 /// }
 /// ```
 #[macro_export]
 macro_rules! plugin {
-    (transform_message: $transform:expr $(,)?) => {
-        /// Reserve guest memory for the host to write the input into.
+    ( $( $hook:ident : $f:expr ),+ $(,)? ) => {
+        /// Reserve guest memory for the host to write a hook's input into.
         #[no_mangle]
         pub extern "C" fn maycord_alloc(len: i32) -> i32 {
             $crate::alloc(len)
         }
+        $( $crate::__maycord_hook!($hook, $f); )+
+    };
+}
 
-        /// Transform one message: the host wrote the UTF-8 message at `ptr..ptr+len`.
+/// Emit the wasm export for one named hook. Matching a hook name as a literal
+/// token means an unknown name simply has no rule, so it fails to compile.
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __maycord_hook {
+    (transform_message, $f:expr) => {
+        /// Transform one message: the host wrote the UTF-8 text at `ptr..ptr+len`.
         #[no_mangle]
         pub extern "C" fn maycord_transform_message(ptr: i32, len: i32) -> i64 {
-            $crate::run_transform(ptr, len, $transform)
+            $crate::run_transform(ptr, len, $f)
+        }
+    };
+    (transform_draft, $f:expr) => {
+        /// Transform the outgoing draft: the host wrote the UTF-8 text at `ptr..ptr+len`.
+        #[no_mangle]
+        pub extern "C" fn maycord_transform_draft(ptr: i32, len: i32) -> i64 {
+            $crate::run_transform(ptr, len, $f)
         }
     };
 }
