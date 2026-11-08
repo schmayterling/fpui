@@ -91,29 +91,122 @@ pub fn verify_sites(plan: &[PlannedWrite]) -> Result<(), SiteMismatch> {
     Ok(())
 }
 
-/// Install the color writes. This is the one step that rewrites the target's
-/// execution and is not yet wired.
+/// Install the color writes: the one step that rewrites the target's execution.
+///
+/// With the `frida` feature (and on macOS) this attaches a frida-gum probe at
+/// each verified site that overwrites the live color. Without it, the agent
+/// still verifies everything and then reports that the write backend is absent —
+/// so a build without `frida` never silently pretends to patch.
+#[cfg(all(target_os = "macos", feature = "frida"))]
+pub fn apply(plan: &[PlannedWrite]) -> io::Result<()> {
+    frida_backend::apply(plan)
+}
+
+/// Fallback when the write backend is not compiled in.
+#[cfg(not(all(target_os = "macos", feature = "frida")))]
 pub fn apply(_plan: &[PlannedWrite]) -> io::Result<()> {
-    // ponytail: the ceiling here is the hook backend, not the surrounding flow.
-    // The plan, color encoding, identity gate and byte verification are real and
-    // tested; what remains is a frida-gum `Interceptor::attach_instruction` at
-    // each site that writes the encoded color into its register/stack slot, plus
-    // the reverse engineering that fills a real adapter's offsets. Upgrade path
-    // and recipe: the maycord research notes.
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "frida apply backend not yet wired",
+        "frida apply backend not enabled; build the agent with --features frida on macOS",
     ))
 }
 
+#[cfg(all(target_os = "macos", feature = "frida"))]
+mod frida_backend {
+    use std::io;
+
+    use frida_gum::interceptor::{InvocationContext, Interceptor, ProbeListener};
+    use frida_gum::{Gum, NativePointer};
+    use maycord_target::ValueLocation;
+
+    use crate::{EncodedColor, PlannedWrite};
+
+    /// A probe bound to one site: when execution reaches the pinned instruction,
+    /// it overwrites the live color register before that instruction runs.
+    struct ColorProbe {
+        reg: usize,
+        value: u64,
+    }
+
+    impl ProbeListener for ColorProbe {
+        fn on_hit(&mut self, context: InvocationContext) {
+            let mut cpu = context.cpu_context();
+            // Only reached for sites apply() already checked, so this cannot be
+            // a read-only context or an out-of-range register.
+            if cpu.set_reg(self.reg, self.value).is_err() {
+                debug_assert!(false, "probe cpu context was unexpectedly read-only");
+            }
+        }
+    }
+
+    /// What this backend can write today: a packed `u32` color in a general
+    /// register `x0..x28`. Vector-register (`f32x4`) and stack writes are
+    /// expressible in an adapter but not yet applied here; such a site is
+    /// rejected up front rather than attached to and silently ignored.
+    fn probe_for(write: &PlannedWrite) -> io::Result<ColorProbe> {
+        match (write.location, write.color) {
+            (ValueLocation::General(n), EncodedColor::U32(word)) if (n as usize) < 29 => {
+                Ok(ColorProbe {
+                    reg: n as usize,
+                    value: word as u64,
+                })
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "site `{}`: this backend writes only a srgb_u32 color into x0..x28 so far",
+                    write.token
+                ),
+            )),
+        }
+    }
+
+    pub fn apply(plan: &[PlannedWrite]) -> io::Result<()> {
+        // Build every probe first: if any site is unsupported, attach nothing.
+        let probes: Vec<ColorProbe> = plan.iter().map(probe_for).collect::<Result<_, _>>()?;
+
+        let gum = Gum::obtain();
+        let mut interceptor = Interceptor::obtain(&gum);
+        for (write, probe) in plan.iter().zip(probes) {
+            // Leak the probe so its vtable outlives this call for the process's
+            // lifetime; a mod stays attached until the process exits.
+            let probe = Box::leak(Box::new(probe));
+            let address = NativePointer(write.runtime_addr as *mut core::ffi::c_void);
+            interceptor
+                .attach_instruction(address, probe)
+                .map_err(|e| io::Error::other(format!("attach at {:#x}: {e:?}", write.runtime_addr)))?;
+        }
+        // Keep gum and the interceptor alive for the process lifetime too.
+        Box::leak(Box::new((gum, interceptor)));
+        Ok(())
+    }
+}
+
 /// The load base of the main executable image (its preferred base plus the ASLR
-/// slide). Image index 0 is always the main executable.
+/// slide). We cannot assume image index 0: an inserted library (the agent
+/// itself, via `DYLD_INSERT_LIBRARIES`) can take index 0, so we find the image
+/// whose Mach-O filetype is `MH_EXECUTE` instead.
 #[cfg(target_os = "macos")]
 #[allow(deprecated)] // libc prefers the mach2 crate's binding; the dyld API itself is stable.
-pub fn main_image_base() -> u64 {
-    // SAFETY: image 0 (the main executable) always exists; the dyld image API
-    // returns its mach_header pointer, which sits at the image's load base.
-    unsafe { libc::_dyld_get_image_header(0) as u64 }
+pub fn main_image_base() -> Option<u64> {
+    const MH_EXECUTE: u32 = 0x2;
+    // SAFETY: the dyld image APIs are defined for indices in `0..count`; each
+    // header pointer is a readable `mach_header_64`, whose `filetype` is the 4th
+    // `u32` (byte offset 12). We only read it.
+    unsafe {
+        let count = libc::_dyld_image_count();
+        for i in 0..count {
+            let header = libc::_dyld_get_image_header(i);
+            if header.is_null() {
+                continue;
+            }
+            let filetype = *(header as *const u32).add(3);
+            if filetype == MH_EXECUTE {
+                return Some(header as u64);
+            }
+        }
+        None
+    }
 }
 
 /// Run the whole agent flow once: load adapter + theme, locate the image, plan,
@@ -123,7 +216,9 @@ pub fn run() -> io::Result<()> {
     let adapter = adapter_from_env()?;
     let package = theme_from_env()?;
     let variant = pick_variant(&package)?;
-    let plan = plan_writes(&adapter, variant, main_image_base());
+    let base = main_image_base()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "main executable image not found"))?;
+    let plan = plan_writes(&adapter, variant, base);
     verify_sites(&plan).map_err(invalid)?;
     apply(&plan)
 }
@@ -201,7 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn apply_is_honestly_unimplemented() {
+    #[cfg(not(feature = "frida"))]
+    fn apply_without_the_backend_reports_it() {
         assert_eq!(apply(&[]).unwrap_err().kind(), io::ErrorKind::Unsupported);
     }
 }

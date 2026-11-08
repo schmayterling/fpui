@@ -17,3 +17,6 @@ ctor = "0.2"
 
 [lints]
 workspace = true
+
+[features]
+frida = ["maycord-loader/frida"]

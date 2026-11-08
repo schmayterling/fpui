@@ -12,6 +12,7 @@ maycord-theme.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+frida-gum = { version = "0.17.2", optional = true, features = ["auto-download", "invocation-listener"] }
 libc = "0.2"
 
 # This crate is the deliberate exception to the workspace-wide `unsafe_code =
@@ -23,3 +24,6 @@ unsafe_code = "allow"
 
 [dev-dependencies]
 maycord-manifest.workspace = true
+
+[features]
+frida = ["dep:frida-gum"]
