@@ -553,6 +553,7 @@ mod tests {
             sites,
             events: vec![],
             returns: vec![],
+            args: vec![],
             patches: vec![],
         }
     }

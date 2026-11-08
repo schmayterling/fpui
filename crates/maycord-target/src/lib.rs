@@ -237,6 +237,59 @@ impl ReturnSite {
     }
 }
 
+/// How to rewrite one of a detoured function's arguments on the way in. The
+/// function then runs with the new value — the Vencord `before` case, where a
+/// patch changes what a call receives (force a flag, redact a string, swap an
+/// option) without touching the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ArgOp {
+    /// Replace the argument with a fixed word whatever the caller passed.
+    Force { value: u64 },
+}
+
+impl ArgOp {
+    /// The value to pass in place of `real`, the argument the caller actually
+    /// provided. Pure so it can be unit-tested without a live process; `real` is
+    /// unused by [`Force`](ArgOp::Force) but kept for future dynamic ops.
+    pub fn rewrite(&self, _real: u64) -> u64 {
+        match *self {
+            ArgOp::Force { value } => value,
+        }
+    }
+}
+
+/// A function in the target to detour so maycord can overwrite one of its
+/// arguments before its body runs. Pinned to the function entry by exact bytes,
+/// like an [`EventSite`]; `arg` is the zero-based argument index (arg 0 is the
+/// first — `x0` on aarch64) and [`ArgOp`] says how to change it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArgSite {
+    /// A label for logs (e.g. `"disable-animations"`).
+    pub token: String,
+    /// Image-relative address of the function's entry instruction.
+    pub image_offset: u64,
+    /// The exact bytes expected there; the loader refuses to detour on mismatch.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// Which argument to overwrite (zero-based).
+    pub arg: u8,
+    /// How to change that argument on the way in.
+    pub op: ArgOp,
+    /// Optional signature to relocate this entry when the build has drifted. When
+    /// absent, the entry is pinned only to its exact `image_offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+}
+
+impl ArgSite {
+    /// The runtime address of the function entry given the image's load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
+}
+
 /// A spot to overwrite with new bytes of the same length: a verified in-place
 /// patch. Where a [`PaletteSite`] writes a colour the renderer reads and an
 /// [`EventSite`] detours a call, this simply replaces the bytes, which covers
@@ -356,6 +409,10 @@ pub struct TargetAdapter {
     /// Empty unless the adapter overrides a return.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub returns: Vec<ReturnSite>,
+    /// Functions one of whose arguments to rewrite before they run (Vencord
+    /// `before`). Empty unless the adapter overrides an argument.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<ArgSite>,
     /// Same-length byte overwrites: inject UI text, neutralise a function. Empty
     /// unless the adapter patches bytes directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -371,6 +428,7 @@ impl TargetAdapter {
             && self.events.is_empty()
             && self.patches.is_empty()
             && self.returns.is_empty()
+            && self.args.is_empty()
         {
             return Err(VerifyError::NoSites);
         }
@@ -487,6 +545,7 @@ mod tests {
             }],
             events: vec![],
             returns: vec![],
+            args: vec![],
             patches: vec![],
         }
     }
@@ -585,6 +644,25 @@ mod tests {
         assert_eq!(ReturnOp::InvertBool.rewrite(1), 0);
         assert_eq!(ReturnOp::InvertBool.rewrite(0x11223344), 0);
         assert_eq!(ReturnOp::Force { value: 7 }.rewrite(0x11223344), 7);
+    }
+
+    #[test]
+    fn an_arg_site_round_trips_and_its_op_rewrites() {
+        let mut a = adapter();
+        a.args = vec![ArgSite {
+            token: "disable-animations".into(),
+            image_offset: 0xa000,
+            expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
+            arg: 2,
+            op: ArgOp::Force { value: 0 },
+            signature: None,
+        }];
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
+        assert_eq!(a.args[0].runtime_addr(0x1_0000_0000), 0x1_0000_a000);
+        // Force ignores what the caller passed and yields the fixed word.
+        assert_eq!(ArgOp::Force { value: 0 }.rewrite(0x9999), 0);
+        assert_eq!(ArgOp::Force { value: 42 }.rewrite(7), 42);
     }
 
     #[test]

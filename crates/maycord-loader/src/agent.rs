@@ -201,7 +201,7 @@ mod frida_backend {
 
     use frida_gum::interceptor::{InvocationContext, InvocationListener, Interceptor, ProbeListener};
     use frida_gum::{Gum, NativePointer};
-    use maycord_target::{EventKind, ReturnOp, StringArg, TargetAdapter, ValueLocation};
+    use maycord_target::{ArgOp, EventKind, ReturnOp, StringArg, TargetAdapter, ValueLocation};
 
     use crate::{EncodedColor, PlannedWrite};
 
@@ -400,6 +400,52 @@ mod frida_backend {
         Box::leak(Box::new((gum, interceptor)));
         Ok(())
     }
+
+    /// A listener on a function entry that overwrites one argument before the
+    /// body runs — maycord's `before` primitive. The function then executes with
+    /// the new value; its own logic and side effects are untouched.
+    struct ArgProbe {
+        arg: u32,
+        op: ArgOp,
+    }
+
+    impl InvocationListener for ArgProbe {
+        fn on_enter(&mut self, context: InvocationContext) {
+            let real = context.arg(self.arg) as u64;
+            context.set_arg(self.arg, self.op.rewrite(real) as usize);
+        }
+
+        fn on_leave(&mut self, _context: InvocationContext) {}
+    }
+
+    /// Detour each argument-override site — checking its pinned entry bytes first
+    /// — so maycord rewrites the chosen argument before the real function runs. A
+    /// moved site is skipped and reported, like the other detours.
+    pub fn attach_args(adapter: &TargetAdapter, image_base: u64) -> io::Result<()> {
+        let gum = Gum::obtain();
+        let mut interceptor = Interceptor::obtain(&gum);
+        for site in &adapter.args {
+            let addr = site.runtime_addr(image_base);
+            // SAFETY: read-only check of the pinned bytes at the resolved entry.
+            let actual = unsafe {
+                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
+            };
+            if actual != site.expected_bytes.as_slice() {
+                eprintln!(
+                    "maycord: skipping arg site `{}` at {addr:#x}; pinned bytes moved",
+                    site.token
+                );
+                continue;
+            }
+            let probe = Box::leak(Box::new(ArgProbe { arg: site.arg as u32, op: site.op }));
+            let np = NativePointer(addr as *mut core::ffi::c_void);
+            interceptor
+                .attach(np, probe)
+                .map_err(|e| io::Error::other(format!("attach arg at {addr:#x}: {e:?}")))?;
+        }
+        Box::leak(Box::new((gum, interceptor)));
+        Ok(())
+    }
 }
 
 /// Where the main executable is loaded in memory (its preferred base plus the
@@ -522,6 +568,12 @@ pub fn run() -> io::Result<()> {
     if !adapter.returns.is_empty() {
         if let Err(e) = frida_backend::attach_returns(&adapter, base) {
             eprintln!("maycord: return override failed: {e}");
+        }
+    }
+    #[cfg(all(target_os = "macos", feature = "frida"))]
+    if !adapter.args.is_empty() {
+        if let Err(e) = frida_backend::attach_args(&adapter, base) {
+            eprintln!("maycord: arg override failed: {e}");
         }
     }
 
