@@ -18,7 +18,7 @@ use maycord_theme::{ThemePackage, Variant};
 use maycord_wasm::WasmPlugin;
 use serde::Deserialize;
 
-use crate::{plan_writes, PlannedWrite};
+use crate::{plan_writes, resolve_adapter, PlannedWrite};
 
 fn invalid(e: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
@@ -429,6 +429,24 @@ pub fn run() -> io::Result<()> {
     let variant = pick_variant(&package)?;
     let base = main_image_base()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "main executable image not found"))?;
+    // Resolve each site to where it actually sits in this build before planning,
+    // so a drifted version still patches. We read the target's own file from disk
+    // (its on-disk layout matches the loaded image) and scan for each site's
+    // signature; sites we can't find are dropped with a note. If we can't read
+    // our own image, fall back to the adapter's exact pinned offsets.
+    let adapter = match std::env::current_exe().and_then(std::fs::read) {
+        Ok(image) => {
+            let (resolved, dropped) = resolve_adapter(&adapter, &image);
+            for label in &dropped {
+                eprintln!("maycord: patch `{label}` not found in this build; skipping");
+            }
+            resolved
+        }
+        Err(e) => {
+            eprintln!("maycord: could not read own image ({e}); using pinned offsets");
+            adapter
+        }
+    };
     let plan = plan_writes(&adapter, variant, base);
     // Run on any version: check each site live, patch the ones that still match,
     // and report the ones a newer build has moved. A single drifted site no

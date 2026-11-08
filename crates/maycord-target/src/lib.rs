@@ -84,6 +84,26 @@ pub enum ValueLocation {
     Indirect { base: u8, offset: i64 },
 }
 
+/// A longer, unique byte window that lets the loader relocate a site when its
+/// absolute `image_offset` has drifted, which happens when a newer build inserts
+/// or removes code before the site. The loader scans the image for `bytes`; the
+/// patch site sits `site_offset` into the one match. Without a signature, a site
+/// is only ever found at its exact `image_offset`, so it breaks on any drift.
+///
+/// The window must be long enough to occur exactly once: a bare instruction
+/// repeats all over a binary, while a dozen-plus bytes spanning the site is
+/// typically unique.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signature {
+    #[serde(with = "hex_bytes")]
+    pub bytes: Vec<u8>,
+    /// Offset of the patch site within `bytes`. The signature often starts a few
+    /// bytes before the site to gain uniqueness, so this is how far in the site
+    /// actually begins.
+    #[serde(default)]
+    pub site_offset: u64,
+}
+
 /// One spot in a specific build where a color is built, plus everything the
 /// loader needs to check that spot and rewrite that one color.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +122,10 @@ pub struct PaletteSite {
     pub encoding: ColorEncoding,
     /// Where the color value is when the probe fires.
     pub location: ValueLocation,
+    /// Optional signature to relocate this site when the build has drifted. When
+    /// absent, the site is pinned only to its exact `image_offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
 }
 
 impl PaletteSite {
@@ -144,6 +168,10 @@ pub struct EventSite {
     pub expected_bytes: Vec<u8>,
     /// Which event this function produces and how to read it.
     pub event: EventKind,
+    /// Optional signature to relocate this entry when the build has drifted. When
+    /// absent, the entry is pinned only to its exact `image_offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
 }
 
 impl EventSite {
@@ -334,6 +362,7 @@ mod tests {
                 expected_bytes: vec![0x1f, 0x20, 0x03, 0xd5], // aarch64 `nop`
                 encoding: ColorEncoding::PremultipliedLinearF32,
                 location: ValueLocation::Vector(8),
+                signature: None,
             }],
             events: vec![],
         }
@@ -399,6 +428,7 @@ mod tests {
                 author: StringArg { ptr_arg: 0, len_arg: 1 },
                 text: StringArg { ptr_arg: 2, len_arg: 3 },
             },
+            signature: None,
         }];
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);

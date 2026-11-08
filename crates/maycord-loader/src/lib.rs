@@ -18,7 +18,9 @@
 //! release binary has no stable Rust layout to rely on, so the loader only ever
 //! touches one checked color slot at a fixed spot.
 
-use maycord_target::{ColorEncoding, EventKind, TargetAdapter, ValueLocation, VerifyError};
+use maycord_target::{
+    ColorEncoding, EventKind, Signature, TargetAdapter, ValueLocation, VerifyError,
+};
 use maycord_theme::{Rgba, Variant};
 
 pub mod agent;
@@ -161,8 +163,23 @@ pub fn preflight(exe_bytes: &[u8], adapter: &TargetAdapter) -> Result<(), Verify
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatchStatus {
     pub label: String,
+    /// The offset the adapter pins (the hint).
     pub image_offset: u64,
     pub supported: bool,
+    /// Where the patch actually sits in this build: `Some(image_offset)` when it
+    /// matched at the hint, `Some(other)` when a signature recovered it from
+    /// drift, and `None` when it could not be found at all.
+    pub resolved_offset: Option<u64>,
+}
+
+impl PatchStatus {
+    /// How far the patch moved from its pinned offset in this build, if found.
+    pub fn drift(&self) -> i64 {
+        match self.resolved_offset {
+            Some(off) => off as i64 - self.image_offset as i64,
+            None => 0,
+        }
+    }
 }
 
 /// How a whole adapter fares against one build. This is the heart of running on
@@ -202,10 +219,118 @@ fn bytes_match(build: &[u8], offset: u64, expected: &[u8]) -> bool {
     build.get(start..start.saturating_add(expected.len())) == Some(expected)
 }
 
+/// First index at or after `from` where `needle` occurs in `haystack`.
+fn find_from(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || from >= haystack.len() {
+        return None;
+    }
+    haystack[from..]
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .map(|p| p + from)
+}
+
+/// Where a site was located in an image.
+enum Located {
+    /// Found at this offset (equal to the hint when it didn't drift).
+    At(u64),
+    /// Not at the hint, and either no signature was given or it did not match
+    /// exactly once.
+    Missing,
+}
+
+/// Find a site's real offset in `image`. The fast path is the hint still holding
+/// its expected bytes, which is the common case on the exact pinned build. When
+/// it has moved, and a signature is given, scan for the signature's single
+/// occurrence and recover the drifted offset. Zero or several signature matches
+/// both count as missing, because maycord must never guess which copy to patch.
+fn locate(image: &[u8], hint: u64, expected: &[u8], signature: Option<&Signature>) -> Located {
+    if bytes_match(image, hint, expected) {
+        return Located::At(hint);
+    }
+    let Some(sig) = signature else {
+        return Located::Missing;
+    };
+    let mut found = None;
+    let mut from = 0;
+    while let Some(at) = find_from(image, &sig.bytes, from) {
+        if found.is_some() {
+            return Located::Missing; // ambiguous: the signature is not unique
+        }
+        found = Some(at);
+        from = at + 1;
+    }
+    match found {
+        // The recovered spot must still carry the pinned bytes, so a signature
+        // that happens to land next to different code is rejected.
+        Some(at) => {
+            let offset = at as u64 + sig.site_offset;
+            if bytes_match(image, offset, expected) {
+                Located::At(offset)
+            } else {
+                Located::Missing
+            }
+        }
+        None => Located::Missing,
+    }
+}
+
 fn event_label(event: &EventKind) -> String {
     match event {
         EventKind::MessageReceived { .. } => "message_received".to_string(),
         _ => "event".to_string(),
+    }
+}
+
+/// Rewrite every site and event offset to where it actually sits in `image`,
+/// using each one's signature to recover from drift. Sites that can't be located
+/// are dropped, so planning only ever sees patches that are really present in
+/// this build, and the dropped labels are returned for reporting. This is what
+/// lets the agent apply a drifted adapter instead of just detecting the drift.
+pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter, Vec<String>) {
+    let mut resolved = adapter.clone();
+    let mut dropped = Vec::new();
+    resolved.sites.retain_mut(|s| {
+        match locate(image, s.image_offset, &s.expected_bytes, s.signature.as_ref()) {
+            Located::At(off) => {
+                s.image_offset = off;
+                true
+            }
+            Located::Missing => {
+                dropped.push(s.token.clone());
+                false
+            }
+        }
+    });
+    resolved.events.retain_mut(|e| {
+        match locate(image, e.image_offset, &e.expected_bytes, e.signature.as_ref()) {
+            Located::At(off) => {
+                e.image_offset = off;
+                true
+            }
+            Located::Missing => {
+                dropped.push(event_label(&e.event));
+                false
+            }
+        }
+    });
+    (resolved, dropped)
+}
+
+fn status(label: String, hint: u64, located: Located) -> PatchStatus {
+    match located {
+        Located::At(offset) => PatchStatus {
+            label,
+            image_offset: hint,
+            supported: true,
+            resolved_offset: Some(offset),
+        },
+        Located::Missing => PatchStatus {
+            label,
+            image_offset: hint,
+            supported: false,
+            resolved_offset: None,
+        },
     }
 }
 
@@ -218,18 +343,17 @@ pub fn check_patches(adapter: &TargetAdapter, build: &[u8]) -> PatchReport {
     let sha256 = maycord_target::sha256(build);
     let mut patches = Vec::with_capacity(adapter.sites.len() + adapter.events.len());
     for site in &adapter.sites {
-        patches.push(PatchStatus {
-            label: site.token.clone(),
-            image_offset: site.image_offset,
-            supported: bytes_match(build, site.image_offset, &site.expected_bytes),
-        });
+        let loc = locate(build, site.image_offset, &site.expected_bytes, site.signature.as_ref());
+        patches.push(status(site.token.clone(), site.image_offset, loc));
     }
     for event in &adapter.events {
-        patches.push(PatchStatus {
-            label: event_label(&event.event),
-            image_offset: event.image_offset,
-            supported: bytes_match(build, event.image_offset, &event.expected_bytes),
-        });
+        let loc = locate(
+            build,
+            event.image_offset,
+            &event.expected_bytes,
+            event.signature.as_ref(),
+        );
+        patches.push(status(event_label(&event.event), event.image_offset, loc));
     }
     PatchReport {
         identity_matches: sha256 == adapter.identity.sha256,
@@ -309,6 +433,7 @@ mod tests {
             expected_bytes: vec![0x1f, 0x20, 0x03, 0xd5],
             encoding: enc,
             location: ValueLocation::Vector(8),
+            signature: None,
         }
     }
 
@@ -437,5 +562,69 @@ mod tests {
         assert!(!report.identity_matches);
         assert!(!report.all_supported());
         assert_eq!(report.broken().next().unwrap().label, "sidebar");
+    }
+
+    fn at(located: Located) -> Option<u64> {
+        match located {
+            Located::At(offset) => Some(offset),
+            Located::Missing => None,
+        }
+    }
+
+    const EXPECT: &[u8] = &[0xaa, 0xbb, 0xcc, 0xdd];
+
+    #[test]
+    fn locate_takes_the_hint_when_its_bytes_are_there() {
+        let mut build = vec![0u8; 64];
+        build[8..12].copy_from_slice(EXPECT);
+        // No signature needed: the hint still holds.
+        assert_eq!(at(locate(&build, 8, EXPECT, None)), Some(8));
+    }
+
+    #[test]
+    fn locate_recovers_a_drifted_site_via_its_signature() {
+        // The hint (offset 8) is wrong, but the signature window sits at 20 with
+        // the pinned bytes two bytes into it, so the real site is 22.
+        let mut build = vec![0u8; 64];
+        build[20..26].copy_from_slice(&[0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd]);
+        let sig = Signature { bytes: vec![0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd], site_offset: 2 };
+        assert_eq!(at(locate(&build, 8, EXPECT, Some(&sig))), Some(22));
+    }
+
+    #[test]
+    fn locate_refuses_an_ambiguous_signature() {
+        // The same window appears twice: maycord must not guess which to patch.
+        let mut build = vec![0u8; 64];
+        let win = [0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd];
+        build[20..26].copy_from_slice(&win);
+        build[40..46].copy_from_slice(&win);
+        let sig = Signature { bytes: win.to_vec(), site_offset: 2 };
+        assert_eq!(at(locate(&build, 8, EXPECT, Some(&sig))), None);
+    }
+
+    #[test]
+    fn locate_is_missing_when_the_hint_fails_and_there_is_no_signature() {
+        let build = vec![0u8; 64];
+        assert_eq!(at(locate(&build, 8, EXPECT, None)), None);
+    }
+
+    #[test]
+    fn resolve_adapter_rewrites_offsets_and_drops_the_unfound() {
+        // sidebar drifts but has a signature to recover; background has no
+        // signature and its hint fails, so it is dropped.
+        let mut build = vec![0u8; 128];
+        build[60..64].copy_from_slice(EXPECT);
+        let mut sidebar = site("sidebar", 8, ColorEncoding::SrgbU32);
+        sidebar.expected_bytes = EXPECT.to_vec();
+        sidebar.signature = Some(Signature { bytes: EXPECT.to_vec(), site_offset: 0 });
+        let mut background = site("background", 100, ColorEncoding::SrgbU32);
+        background.expected_bytes = EXPECT.to_vec();
+        let adapter = adapter_with(vec![sidebar, background], &build);
+
+        let (resolved, dropped) = resolve_adapter(&adapter, &build);
+        assert_eq!(resolved.sites.len(), 1);
+        assert_eq!(resolved.sites[0].token, "sidebar");
+        assert_eq!(resolved.sites[0].image_offset, 60); // recovered from 8
+        assert_eq!(dropped, vec!["background".to_string()]);
     }
 }
