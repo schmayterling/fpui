@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The authorized-target loader: identity-gated launch, palette-write planning, and the in-process agent for patching a verified GPUI build. The one maycord crate allowed to use unsafe."
+description = "The authorized-target loader and in-process agent: identity-gated launch, palette-write planning, color writes, and hosting sandboxed wasm plugins inside a verified GPUI build. The one maycord crate allowed to use unsafe."
 
 [dependencies]
 maycord-target.workspace = true
 maycord-theme.workspace = true
+maycord-host.workspace = true
+maycord-wasm.workspace = true
+maycord-manifest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -23,7 +27,7 @@ libc = "0.2"
 unsafe_code = "allow"
 
 [dev-dependencies]
-maycord-manifest.workspace = true
+wat = "1"
 
 [features]
 frida = ["dep:frida-gum"]

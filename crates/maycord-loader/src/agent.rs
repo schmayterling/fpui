@@ -11,13 +11,51 @@
 
 use std::io;
 
+use maycord_host::Host;
+use maycord_manifest::{Capability, Manifest};
 use maycord_target::TargetAdapter;
 use maycord_theme::{ThemePackage, Variant};
+use maycord_wasm::WasmPlugin;
+use serde::Deserialize;
 
 use crate::{plan_writes, PlannedWrite};
 
 fn invalid(e: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+/// One plugin to host: where its wasm module is on disk, its manifest, and the
+/// capabilities the user granted it.
+#[derive(Deserialize)]
+struct PluginEntry {
+    wasm: String,
+    manifest: Manifest,
+    granted: Vec<Capability>,
+}
+
+fn load_one(entry: &PluginEntry) -> Result<WasmPlugin, String> {
+    let bytes = std::fs::read(&entry.wasm).map_err(|e| e.to_string())?;
+    WasmPlugin::load(&bytes).map_err(|e| e.to_string())
+}
+
+/// Load the wasm plugins described by `config` (a JSON array of [`PluginEntry`])
+/// into a capability-gated [`Host`]. A plugin that fails to load or register is
+/// skipped with a note on stderr rather than stopping the rest: one bad mod must
+/// not disable the others.
+pub fn load_plugins(config: &str) -> io::Result<Host> {
+    let entries: Vec<PluginEntry> = serde_json::from_str(config).map_err(invalid)?;
+    let mut host = Host::new();
+    for entry in entries {
+        match load_one(&entry) {
+            Ok(plugin) => {
+                if let Err(e) = host.register(&entry.manifest, &entry.granted, Box::new(plugin)) {
+                    eprintln!("maycord: skipped plugin `{}`: {e}", entry.manifest.id);
+                }
+            }
+            Err(e) => eprintln!("maycord: could not load plugin `{}`: {e}", entry.manifest.id),
+        }
+    }
+    Ok(host)
 }
 
 /// Read and validate the adapter the loader passed by path in `MAYCORD_ADAPTER`.
@@ -249,7 +287,19 @@ pub fn run() -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "main executable image not found"))?;
     let plan = plan_writes(&adapter, variant, base);
     verify_sites(&plan).map_err(invalid)?;
-    apply(&plan)
+    apply(&plan)?;
+
+    // If plugins are configured, host them in-process and announce readiness.
+    // Delivering backend events (a received message, ...) to these hooks is the
+    // next step; today the agent just loads and readies them.
+    if let Some(path) = std::env::var_os("MAYCORD_PLUGINS") {
+        let config = std::fs::read_to_string(path)?;
+        let mut host = load_plugins(&config)?;
+        host.broadcast(&maycord_host::Event::Ready);
+        // Keep the host and its plugins alive for the process lifetime.
+        Box::leak(Box::new(host));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -328,5 +378,47 @@ mod tests {
     #[cfg(not(feature = "frida"))]
     fn apply_without_the_backend_reports_it() {
         assert_eq!(apply(&[]).unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+
+    // A minimal uppercase plugin, as wasm, to host.
+    const UP_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (global $heap (mut i32) (i32.const 1024))
+      (func $alloc (export "maycord_alloc") (param $n i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $heap))
+        (global.set $heap (i32.add (global.get $heap) (local.get $n)))
+        (local.get $p))
+      (func (export "maycord_transform_message") (param $ptr i32) (param $len i32) (result i64)
+        (local $out i32) (local $i i32) (local $b i32)
+        (local.set $out (call $alloc (local.get $len)))
+        (block $done
+          (loop $loop
+            (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+            (local.set $b (i32.load8_u (i32.add (local.get $ptr) (local.get $i))))
+            (if (i32.and (i32.ge_u (local.get $b) (i32.const 97))
+                         (i32.le_u (local.get $b) (i32.const 122)))
+              (then (local.set $b (i32.sub (local.get $b) (i32.const 32)))))
+            (i32.store8 (i32.add (local.get $out) (local.get $i)) (local.get $b))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $loop)))
+        (i64.or
+          (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
+          (i64.extend_i32_u (local.get $len)))))
+    "#;
+
+    #[test]
+    fn load_plugins_hosts_a_wasm_plugin() {
+        let wasm = wat::parse_str(UP_WAT).unwrap();
+        let path = std::env::temp_dir().join("maycord_loader_test_plugin.wasm");
+        std::fs::write(&path, &wasm).unwrap();
+        let config = format!(
+            r#"[{{"wasm":{:?},"manifest":{{"api_version":1,"id":"up","name":"Up","version":"1","author":"a","license":"MIT","source":"s","kind":"plugin","capabilities":["message_content"]}},"granted":["message_content"]}}]"#,
+            path.to_str().unwrap()
+        );
+        let mut host = load_plugins(&config).unwrap();
+        assert_eq!(host.len(), 1);
+        assert_eq!(host.render_message("a", "hello"), "HELLO");
     }
 }
