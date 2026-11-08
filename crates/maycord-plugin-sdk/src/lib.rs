@@ -1,0 +1,77 @@
+//! Write a maycord plugin and compile it to WebAssembly.
+//!
+//! maycord runs plugins as wasm modules (a native client has no JS engine to
+//! inject into). This crate is the guest side: it hides the raw host↔plugin ABI
+//! behind a small [`plugin!`] macro, modelled on Vencord's `definePlugin`, so a
+//! plugin author only writes the hook they care about:
+//!
+//! ```ignore
+//! maycord_plugin_sdk::plugin! {
+//!     transform_message: |content: &str| content.replace("secret", "[redacted]"),
+//! }
+//! ```
+//!
+//! Compile that crate for `wasm32-unknown-unknown` as a `cdylib` and the result
+//! loads straight into [`maycord_wasm`](https://docs.rs). The macro emits the
+//! two exports the host calls — `maycord_alloc` and `maycord_transform_message`
+//! — using the helpers below.
+
+/// Reserve `len` bytes in the plugin's own memory and return the offset. The
+/// host calls this, writes the input message there, then calls the transform.
+///
+/// The buffer is handed to the host and reclaimed by [`run_transform`], so it is
+/// deliberately leaked here.
+pub fn alloc(len: i32) -> i32 {
+    let mut buf = vec![0u8; len.max(0) as usize];
+    let ptr = buf.as_mut_ptr() as i32;
+    core::mem::forget(buf);
+    ptr
+}
+
+/// The glue behind `plugin!`'s message hook: read the input the host wrote, run
+/// the author's `transform`, and return the result packed as
+/// `(out_ptr as u64) << 32 | out_len as u64`.
+///
+/// Ceiling: the output buffer is leaked so the host can read it after this
+/// returns, so a plugin's memory grows slowly over very many messages until it
+/// hits wasmi's cap, after which transforms no-op. A later ABI revision adds an
+/// explicit free; for now a plugin is cheap to reload.
+pub fn run_transform<F: FnOnce(&str) -> String>(ptr: i32, len: i32, transform: F) -> i64 {
+    let len = len.max(0) as usize;
+    // SAFETY: `ptr`/`len` name the buffer the host got from `alloc` and filled
+    // with the message before calling us; we take it back to free it.
+    let input = unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) };
+    let text = String::from_utf8_lossy(&input).into_owned();
+    drop(input);
+
+    let mut out = transform(&text).into_bytes();
+    let out_ptr = out.as_mut_ptr() as u32;
+    let out_len = out.len() as u32;
+    core::mem::forget(out);
+    (((out_ptr as u64) << 32) | out_len as u64) as i64
+}
+
+/// Define a maycord plugin. Give it the hooks you want; the macro emits the wasm
+/// exports maycord's host calls.
+///
+/// ```ignore
+/// maycord_plugin_sdk::plugin! {
+///     transform_message: |content: &str| content.to_uppercase(),
+/// }
+/// ```
+#[macro_export]
+macro_rules! plugin {
+    (transform_message: $transform:expr $(,)?) => {
+        /// Reserve guest memory for the host to write the input into.
+        #[no_mangle]
+        pub extern "C" fn maycord_alloc(len: i32) -> i32 {
+            $crate::alloc(len)
+        }
+
+        /// Transform one message: the host wrote the UTF-8 message at `ptr..ptr+len`.
+        #[no_mangle]
+        pub extern "C" fn maycord_transform_message(ptr: i32, len: i32) -> i64 {
+            $crate::run_transform(ptr, len, $transform)
+        }
+    };
+}

@@ -1,0 +1,14 @@
+[package]
+name = "uppercase-plugin"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+maycord-plugin-sdk = { path = "../../crates/maycord-plugin-sdk" }
+
+# Standalone so the main workspace doesn't build this wasm-targeted crate for the host.
+[workspace]

@@ -1,0 +1,12 @@
+[package]
+name = "maycord-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Write a maycord plugin in Rust and compile it to wasm: the guest-side ABI glue plus a `plugin!` macro, modelled on Vencord's definePlugin."
+
+# The guest ABI reclaims a buffer the host wrote into (a raw pointer), so this
+# crate needs unsafe. It opts out of the workspace-wide `unsafe_code = forbid`.
+[lints.rust]
+unsafe_code = "allow"

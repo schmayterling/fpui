@@ -745,6 +745,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "maycord-plugin-sdk"
+version = "0.1.0"
+
+[[package]]
 name = "maycord-target"
 version = "0.1.0"
 dependencies = [
