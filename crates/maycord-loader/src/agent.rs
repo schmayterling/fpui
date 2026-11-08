@@ -384,10 +384,23 @@ pub fn main_image_base() -> Option<u64> {
     (base != 0).then_some(base)
 }
 
+/// Where the main executable is loaded: `GetModuleHandle(NULL)` returns the
+/// running process's own image handle, which is its base address.
+#[cfg(target_os = "windows")]
+pub fn main_image_base() -> Option<u64> {
+    extern "system" {
+        fn GetModuleHandleW(module_name: *const u16) -> *mut core::ffi::c_void;
+    }
+    // SAFETY: `GetModuleHandleW(NULL)` returns the base-address handle of the
+    // current process's executable and does not fail for it.
+    let handle = unsafe { GetModuleHandleW(core::ptr::null()) };
+    (!handle.is_null()).then_some(handle as u64)
+}
+
 /// Run the whole agent once: load the adapter and theme, find the image, build
 /// the plan, verify it, and apply. Called from the agent dylib's startup
 /// constructor.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn run() -> io::Result<()> {
     let adapter = adapter_from_env()?;
     let package = theme_from_env()?;

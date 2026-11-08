@@ -9,7 +9,7 @@
 /// Runs as the agent dylib loads into the target. It runs the agent and prints
 /// any failure to stderr without bringing the process down — a mod that can't
 /// apply must never crash the client.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[ctor::ctor]
 fn maycord_init() {
     if let Err(error) = maycord_loader::agent::run() {

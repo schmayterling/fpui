@@ -11,8 +11,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 maycord-loader.workspace = true
-
-[target.'cfg(unix)'.dependencies]
 ctor = "0.2"
 
 [lints]
