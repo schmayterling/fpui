@@ -9,6 +9,13 @@
 //! `adrp`+`add` pair that forms its address, and map that reference back to the
 //! function that contains it.
 //!
+//! Rust panic-location paths (the richest anchor supply) are referenced *one hop*
+//! away: code points at a `core::panic::Location` static, and the static points at
+//! the path string. When no `adrp`+`add` forms a string's address directly, the
+//! resolver falls back to that indirection — find the `Location` whose file
+//! pointer decodes to the string, then xref the `Location` itself — transparently,
+//! so a panic path still resolves to a normal [`Anchor`].
+//!
 //! This augments byte-matching rather than replacing it: an anchor resolves
 //! *where* a function is on a new build, and the caller still verifies the pinned
 //! bytes there before writing. aarch64 + Mach-O only — maycord's target.
@@ -120,6 +127,9 @@ pub fn resolve_anchors(
     let mut results: Vec<Result<Anchor, AnchorError>> = Vec::with_capacity(needles.len());
     let mut slot_vmaddr: Vec<Option<u64>> = vec![None; needles.len()];
     let mut targets: HashMap<u64, usize> = HashMap::new();
+    // The same unique strings, keyed by image-relative offset, for the panic-
+    // `Location` fallback: a chained-fixup file pointer stores exactly this offset.
+    let mut loc_want: HashMap<u64, usize> = HashMap::new();
     for i in 0..needles.len() {
         match (counts[i], firsts[i]) {
             (0, _) => results.push(Err(AnchorError::StringMissing)),
@@ -127,16 +137,26 @@ pub fn resolve_anchors(
                 results.push(Err(AnchorError::NoReference)); // filled in after the scan
                 slot_vmaddr[i] = Some(vmaddr);
                 targets.insert(vmaddr, i);
+                loc_want.insert(vmaddr.wrapping_sub(text_seg_vmaddr), i);
             }
             (n, _) => results.push(Err(AnchorError::StringAmbiguous(n))),
         }
     }
+    // A string with no direct `adrp`+`add` may still be reachable one hop away via
+    // its Rust panic `Location` static. Find those statics up front (one pass over
+    // `__DATA_CONST,__const`, batched over all needles) so the single `__text` pass
+    // can target them alongside the direct string addresses.
+    let loc_targets = find_locations(&macho, &loc_want, needles);
 
     // One pass over __text: each adjacent `adrp`+`add` that forms a target address
-    // records the function it sits in, per anchor slot.
+    // records the function it sits in, per anchor slot. Direct string references
+    // and panic-`Location` references are tallied separately so the latter is only
+    // ever a fallback — a directly-referenced string resolves exactly as before.
     let mut funcs: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); needles.len()];
     let mut first_xref: Vec<Option<u64>> = vec![None; needles.len()];
-    if !targets.is_empty() {
+    let mut loc_funcs: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); needles.len()];
+    let mut loc_first_xref: Vec<Option<u64>> = vec![None; needles.len()];
+    if !targets.is_empty() || !loc_targets.is_empty() {
         let mut prev: Option<(usize, u32)> = None;
         for (idx, chunk) in data.chunks_exact(4).enumerate() {
             let word = u32::from_le_bytes(chunk.try_into().unwrap());
@@ -146,10 +166,16 @@ pub fn resolve_anchors(
                     (decode_adrp(adrp_word, pc), decode_add_imm(word))
                 {
                     if add_rn == rd && add_rd == rd {
-                        if let Some(&slot) = targets.get(&page.wrapping_add(val)) {
+                        let hit = page.wrapping_add(val);
+                        if let Some(&slot) = targets.get(&hit) {
                             if let Some(func) = enclosing(&starts, pc) {
                                 funcs[slot].insert(func);
                                 first_xref[slot].get_or_insert(pc);
+                            }
+                        } else if let Some(&slot) = loc_targets.get(&hit) {
+                            if let Some(func) = enclosing(&starts, pc) {
+                                loc_funcs[slot].insert(func);
+                                loc_first_xref[slot].get_or_insert(pc);
                             }
                         }
                     }
@@ -159,14 +185,21 @@ pub fn resolve_anchors(
         }
     }
 
-    // Decide each scanned slot: exactly one enclosing function is a hit.
+    // Decide each scanned slot: exactly one enclosing function is a hit. A direct
+    // reference wins; the panic-`Location` indirection is consulted only when the
+    // string is referenced nowhere directly, so existing anchors never change.
     for (i, vmaddr) in slot_vmaddr.into_iter().enumerate() {
         let Some(string_vmaddr) = vmaddr else { continue };
-        results[i] = match funcs[i].len() {
+        let (hits, xref) = if funcs[i].is_empty() {
+            (&loc_funcs[i], loc_first_xref[i])
+        } else {
+            (&funcs[i], first_xref[i])
+        };
+        results[i] = match hits.len() {
             0 => Err(AnchorError::NoReference),
             1 => {
-                let func = *funcs[i].iter().next().unwrap();
-                let xref_pc = first_xref[i].unwrap_or(func);
+                let func = *hits.iter().next().unwrap();
+                let xref_pc = xref.unwrap_or(func);
                 Ok(Anchor {
                     func_offset: text_file_start + (func - text_vmaddr),
                     xref_offset: text_file_start + (xref_pc - text_vmaddr),
@@ -213,6 +246,50 @@ fn find_strings(macho: &Macho<'_>, needles: &[&str]) -> (Vec<usize>, Vec<Option<
         }
     }
     (counts, first)
+}
+
+/// Find the Rust panic `Location` statics that point at the wanted strings, so a
+/// string referenced only *indirectly* can still be anchored.
+///
+/// A `Location` is `{ file: *const u8, file_len: usize, line: u32, col: u32 }`.
+/// Its `file` pointer is stored as an `LC_DYLD_CHAINED_FIXUPS` rebase on disk, not
+/// a literal vmaddr, so a direct `adrp`+`add` scan never forms the string's
+/// address. This scans `__DATA_CONST,__const` once (its pointers are the ones that
+/// get fixed up), decodes each 8-aligned pointer's image-relative target, and when
+/// that target hits a wanted string *and* the adjacent `file_len` equals that
+/// string's length — the len match is what tells a real `Location` from a
+/// coincidental offset — records the `Location`'s own vmaddr against the slot. The
+/// `__text` pass then xrefs the `Location` exactly as it xrefs a direct string.
+/// `want` maps a string's image-relative offset to its slot; empty `want` (no
+/// unique strings) returns an empty map and skips the scan entirely.
+fn find_locations(
+    macho: &Macho<'_>,
+    want: &HashMap<u64, usize>,
+    needles: &[&str],
+) -> HashMap<u64, usize> {
+    let mut out = HashMap::new();
+    if want.is_empty() {
+        return out;
+    }
+    let Some(sec) = macho.sections().find(|s| {
+        matches!(s.segment_name(), Ok(Some("__DATA_CONST"))) && matches!(s.name(), Ok("__const"))
+    }) else {
+        return out;
+    };
+    let Ok(data) = sec.data() else { return out };
+    let base = sec.address();
+    let mut pos = 0usize;
+    while pos + 16 <= data.len() {
+        let raw = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        if let Some(&slot) = want.get(&chained_rebase_offset(raw)) {
+            let file_len = u64::from_le_bytes(data[pos + 8..pos + 16].try_into().unwrap());
+            if file_len == needles[slot].len() as u64 {
+                out.insert(base + pos as u64, slot);
+            }
+        }
+        pos += 8;
+    }
+    out
 }
 
 /// Decode `LC_FUNCTION_STARTS` into the sorted list of function entry VM
@@ -301,6 +378,17 @@ fn decode_add_imm(word: u32) -> Option<(u32, u32, u64)> {
     Some((rd, rn, value))
 }
 
+/// Decode the target offset a Mach-O chained-fixup rebase points at. On arm64,
+/// `__DATA_CONST` pointers are stored as `LC_DYLD_CHAINED_FIXUPS` entries rather
+/// than literal vmaddrs: a rebase keeps the target's image-relative offset in its
+/// low bits and chain metadata (`next`, `bind`, `high8`) in its high bits. The
+/// target is 36 bits; masking the low 40 keeps it whole (bits 36-39 are zero for
+/// any in-image target) while dropping the metadata. Add the image base for the
+/// target vmaddr.
+fn chained_rebase_offset(raw: u64) -> u64 {
+    raw & 0xFF_FFFF_FFFF
+}
+
 /// Read one ULEB128 value, returning it and how many bytes it used (0 if the
 /// slice ended mid-value).
 fn uleb128(bytes: &[u8]) -> (u64, usize) {
@@ -360,6 +448,19 @@ mod tests {
         assert_eq!(uleb128(&[0x80, 0x01]), (128, 2));
         assert_eq!(uleb128(&[0xe5, 0x8e, 0x26]), (624485, 3));
         assert_eq!(uleb128(&[0x80]), (0, 0)); // unterminated
+    }
+
+    #[test]
+    fn chained_rebase_offset_decodes_a_real_zed_location_pointer() {
+        // From /Applications/Zed.app: the `Location` for "crates/gpui/src/color.rs"
+        // at vmaddr 0x1_0a1f_0430 stores file pointer 0x0030_0000_078b_6449 on disk
+        // (LC_DYLD_CHAINED_FIXUPS rebase, verified with xxd). The low 40 bits are
+        // the string's image-relative offset 0x78b_6449; the high bits are chain
+        // metadata (here next=6: the +24-byte stride to the next `Location`).
+        assert_eq!(chained_rebase_offset(0x0030_0000_078b_6449), 0x78b_6449);
+        // The top 24 bits (next/bind/high8) are always dropped.
+        assert_eq!(chained_rebase_offset(0xFFFF_FFAB_CDEF_1234), 0xAB_CDEF_1234);
+        assert_eq!(chained_rebase_offset(0x8000_0000_0000_0000), 0);
     }
 
     #[test]
