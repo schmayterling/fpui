@@ -13,7 +13,7 @@
 //! *where* a function is on a new build, and the caller still verifies the pinned
 //! bytes there before writing. aarch64 + Mach-O only — maycord's target.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use object::read::macho::{LoadCommandVariant, MachOFile64};
 use object::{Endianness, Object, ObjectSection, ObjectSegment};
@@ -74,13 +74,27 @@ impl core::fmt::Display for AnchorError {
 impl std::error::Error for AnchorError {}
 
 /// Resolve `needle` to the function that references it in `image`. The string
-/// must occur exactly once and be referenced from exactly one function.
+/// must occur exactly once and be referenced from exactly one function. A thin
+/// wrapper over [`resolve_anchors`] for the single-string case.
 pub fn resolve_anchor(image: &[u8], needle: &str) -> Result<Anchor, AnchorError> {
-    let macho = Macho::parse(image)
-        .map_err(|e| AnchorError::Parse(e.to_string()))?;
-    let endian = macho.endian();
+    resolve_anchors(image, &[needle])?.pop().unwrap()
+}
 
-    let string_vmaddr = unique_string_vmaddr(&macho, needle.as_bytes())?;
+/// Resolve several string anchors in a SINGLE pass over `__text`.
+///
+/// The `__text` scan is the expensive part (~0.6 s on a 177 MB image); parsing
+/// and the string search are cheap (~0.1 s). Checking every `adrp`+`add` against
+/// a *set* of target addresses means N anchors cost one scan, not N — which is
+/// what makes resolving a whole adapter's sites affordable at load time. The
+/// returned vector is aligned with `needles`: one string's `Err` (missing,
+/// ambiguous, not referenced) never sinks the others. The outer `Err` is only for
+/// a malformed image with no `__text`/function starts, where nothing can resolve.
+pub fn resolve_anchors(
+    image: &[u8],
+    needles: &[&str],
+) -> Result<Vec<Result<Anchor, AnchorError>>, AnchorError> {
+    let macho = Macho::parse(image).map_err(|e| AnchorError::Parse(e.to_string()))?;
+    let endian = macho.endian();
 
     // The __TEXT segment's vmaddr is the image base that function starts and the
     // `adrp` page math are both relative to.
@@ -90,9 +104,6 @@ pub fn resolve_anchor(image: &[u8], needle: &str) -> Result<Anchor, AnchorError>
         .map(|s| s.address())
         .ok_or(AnchorError::NoText)?;
     let starts = function_starts(&macho, endian, text_seg_vmaddr)?;
-
-    // Scan __text for the adjacent `adrp`+`add` pair(s) that form the string's
-    // address, and collect the distinct functions they sit in.
     let text = macho
         .sections()
         .find(|s| matches!(s.name(), Ok("__text")))
@@ -101,48 +112,88 @@ pub fn resolve_anchor(image: &[u8], needle: &str) -> Result<Anchor, AnchorError>
     let text_vmaddr = text.address();
     let (text_file_start, _) = text.file_range().ok_or(AnchorError::NoText)?;
 
-    let mut funcs: BTreeSet<u64> = BTreeSet::new();
-    let mut xref_for = None;
-    let words = data.len() / 4;
-    for idx in 0..words.saturating_sub(1) {
-        let w1 = word_at(data, idx);
-        let pc = text_vmaddr + (idx as u64) * 4;
-        let Some((rd, page)) = decode_adrp(w1, pc) else { continue };
-        let w2 = word_at(data, idx + 1);
-        let Some((add_rd, add_rn, val)) = decode_add_imm(w2) else { continue };
-        if add_rn != rd || add_rd != rd || page.wrapping_add(val) != string_vmaddr {
-            continue;
-        }
-        if let Some(func) = enclosing(&starts, pc) {
-            funcs.insert(func);
-            xref_for.get_or_insert((func, pc));
+    // Resolve each string to its unique address up front, in ONE pass over the
+    // read-only data (~28 MB), not one pass per needle. A missing or ambiguous
+    // string takes its error now and is left out of the scan; the rest become
+    // scan targets, keyed by address back to the slot that wants them.
+    let (counts, firsts) = find_strings(&macho, needles);
+    let mut results: Vec<Result<Anchor, AnchorError>> = Vec::with_capacity(needles.len());
+    let mut slot_vmaddr: Vec<Option<u64>> = vec![None; needles.len()];
+    let mut targets: HashMap<u64, usize> = HashMap::new();
+    for i in 0..needles.len() {
+        match (counts[i], firsts[i]) {
+            (0, _) => results.push(Err(AnchorError::StringMissing)),
+            (1, Some(vmaddr)) => {
+                results.push(Err(AnchorError::NoReference)); // filled in after the scan
+                slot_vmaddr[i] = Some(vmaddr);
+                targets.insert(vmaddr, i);
+            }
+            (n, _) => results.push(Err(AnchorError::StringAmbiguous(n))),
         }
     }
 
-    match funcs.len() {
-        0 => Err(AnchorError::NoReference),
-        1 => {
-            let func = *funcs.iter().next().unwrap();
-            let xref_pc = xref_for.map(|(_, pc)| pc).unwrap_or(func);
-            Ok(Anchor {
-                func_offset: text_file_start + (func - text_vmaddr),
-                xref_offset: text_file_start + (xref_pc - text_vmaddr),
-                string_vmaddr,
-            })
+    // One pass over __text: each adjacent `adrp`+`add` that forms a target address
+    // records the function it sits in, per anchor slot.
+    let mut funcs: Vec<BTreeSet<u64>> = vec![BTreeSet::new(); needles.len()];
+    let mut first_xref: Vec<Option<u64>> = vec![None; needles.len()];
+    if !targets.is_empty() {
+        let mut prev: Option<(usize, u32)> = None;
+        for (idx, chunk) in data.chunks_exact(4).enumerate() {
+            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+            if let Some((adrp_idx, adrp_word)) = prev {
+                let pc = text_vmaddr + (adrp_idx as u64) * 4;
+                if let (Some((rd, page)), Some((add_rd, add_rn, val))) =
+                    (decode_adrp(adrp_word, pc), decode_add_imm(word))
+                {
+                    if add_rn == rd && add_rd == rd {
+                        if let Some(&slot) = targets.get(&page.wrapping_add(val)) {
+                            if let Some(func) = enclosing(&starts, pc) {
+                                funcs[slot].insert(func);
+                                first_xref[slot].get_or_insert(pc);
+                            }
+                        }
+                    }
+                }
+            }
+            prev = Some((idx, word));
         }
-        n => Err(AnchorError::ReferenceAmbiguous(n)),
     }
+
+    // Decide each scanned slot: exactly one enclosing function is a hit.
+    for (i, vmaddr) in slot_vmaddr.into_iter().enumerate() {
+        let Some(string_vmaddr) = vmaddr else { continue };
+        results[i] = match funcs[i].len() {
+            0 => Err(AnchorError::NoReference),
+            1 => {
+                let func = *funcs[i].iter().next().unwrap();
+                let xref_pc = first_xref[i].unwrap_or(func);
+                Ok(Anchor {
+                    func_offset: text_file_start + (func - text_vmaddr),
+                    xref_offset: text_file_start + (xref_pc - text_vmaddr),
+                    string_vmaddr,
+                })
+            }
+            n => Err(AnchorError::ReferenceAmbiguous(n)),
+        };
+    }
+    Ok(results)
 }
 
-/// The single VM address of `needle` across the read-only data sections, or an
-/// ambiguity/absence error. Rust string slices are not NUL-terminated, so this
-/// matches exact bytes, not a C string.
-fn unique_string_vmaddr(
-    macho: &Macho<'_>,
-    needle: &[u8],
-) -> Result<u64, AnchorError> {
-    let mut found: Option<u64> = None;
-    let mut count = 0usize;
+/// For every needle, its occurrence count and first VM address across the
+/// read-only data sections, found in a single pass per section. Needles are
+/// bucketed by first byte, so the scan cost is independent of the needle count —
+/// one rodata pass resolves a whole adapter's strings. Rust string slices are not
+/// NUL-terminated, so this matches exact bytes, not a C string. An empty needle
+/// has no first byte, so it is never bucketed and reports zero occurrences.
+fn find_strings(macho: &Macho<'_>, needles: &[&str]) -> (Vec<usize>, Vec<Option<u64>>) {
+    let mut counts = vec![0usize; needles.len()];
+    let mut first: Vec<Option<u64>> = vec![None; needles.len()];
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); 256];
+    for (i, n) in needles.iter().enumerate() {
+        if let Some(&b0) = n.as_bytes().first() {
+            buckets[b0 as usize].push(i);
+        }
+    }
     for sec in macho.sections() {
         // Strings live in read-only data; __text is code and would only match by
         // coincidence, so it is excluded to keep the anchor honest.
@@ -151,19 +202,17 @@ fn unique_string_vmaddr(
         }
         let Ok(data) = sec.data() else { continue };
         let base = sec.address();
-        let mut from = 0;
-        while let Some(pos) = find(&data[from..], needle) {
-            let at = from + pos;
-            count += 1;
-            found.get_or_insert(base + at as u64);
-            from = at + 1;
+        for pos in 0..data.len() {
+            for &ni in &buckets[data[pos] as usize] {
+                let nb = needles[ni].as_bytes();
+                if data.len() - pos >= nb.len() && &data[pos..pos + nb.len()] == nb {
+                    counts[ni] += 1;
+                    first[ni].get_or_insert(base + pos as u64);
+                }
+            }
         }
     }
-    match count {
-        0 => Err(AnchorError::StringMissing),
-        1 => Ok(found.unwrap()),
-        n => Err(AnchorError::StringAmbiguous(n)),
-    }
+    (counts, first)
 }
 
 /// Decode `LC_FUNCTION_STARTS` into the sorted list of function entry VM
@@ -223,10 +272,6 @@ fn enclosing(starts: &[u64], addr: u64) -> Option<u64> {
     }
 }
 
-fn word_at(data: &[u8], idx: usize) -> u32 {
-    u32::from_le_bytes(data[idx * 4..idx * 4 + 4].try_into().unwrap())
-}
-
 /// Decode an `adrp Xd, imm` into `(Xd, page_base)`, the 4 KiB page its result
 /// points at. Returns `None` if the word is not an `adrp`.
 fn decode_adrp(word: u32, pc: u64) -> Option<(u32, u64)> {
@@ -272,13 +317,6 @@ fn uleb128(bytes: &[u8]) -> (u64, usize) {
         }
     }
     (0, 0)
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > hay.len() {
-        return None;
-    }
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
