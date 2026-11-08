@@ -1,12 +1,11 @@
-//! The maycord theme package: a manifest plus a map of semantic color tokens
-//! for dark and/or light mode.
+//! A maycord theme package: a manifest plus a map of color tokens for dark
+//! and/or light mode.
 //!
-//! A theme carries no code. It maps the client's *semantic* token names
-//! (`background`, `accent`, `text`, …) to concrete colors, and the client
-//! resolves its own widgets through those tokens. This is what makes a theme
-//! renderer-agnostic: the same package re-skins a GPUI client, an egui client,
-//! or anything else that resolves its palette through named tokens, because it
-//! never names a pixel, a shader, or a struct offset.
+//! A theme has no code. It maps named color slots (`background`, `accent`,
+//! `text`, …) to actual colors, and the client looks up its own colors by those
+//! names. That is what makes a theme work on any renderer: the same package can
+//! skin a GPUI client, an egui client, or anything else that looks up colors by
+//! name, because it never refers to a specific pixel, shader, or memory layout.
 //!
 //! ```
 //! let json = r##"{
@@ -29,10 +28,10 @@ use serde::{Deserialize, Serialize};
 mod color;
 pub use color::{ParseColorError, Rgba};
 
-/// The semantic tokens the reference client resolves. A theme may define more
-/// (a plugin might read them) and need not define all of these, but a theme
-/// that covers this set will skin the whole reference UI. Kept deliberately
-/// small; it grows as the client grows, never per-widget.
+/// The color slots the reference client looks up. A theme can define more (a
+/// plugin might read them) and doesn't have to define all of these, but a theme
+/// that covers this set skins the whole reference UI. Kept small on purpose; it
+/// grows as the client grows, not one entry per widget.
 pub const CORE_TOKENS: &[&str] = &[
     "background",  // window and primary surface
     "surface",     // raised panels, cards, the message list
@@ -46,7 +45,7 @@ pub const CORE_TOKENS: &[&str] = &[
     "link",        // hyperlinks and mentions
 ];
 
-/// A complete, parsed theme package: metadata and its color variants.
+/// A parsed theme package: its metadata and its color variants.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ThemePackage {
@@ -64,7 +63,7 @@ pub struct Theme {
     pub light: Option<Variant>,
 }
 
-/// One color scheme: a map from semantic token name to color.
+/// One color scheme: a map from token name to color.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Variant {
@@ -72,13 +71,13 @@ pub struct Variant {
 }
 
 impl Variant {
-    /// Resolve one token, if the variant defines it.
+    /// Look up one token's color, if this variant defines it.
     pub fn get(&self, token: &str) -> Option<Rgba> {
         self.colors.get(token).copied()
     }
 
-    /// The [`CORE_TOKENS`] this variant does not define, in declared order.
-    /// Empty means the variant covers the whole reference UI.
+    /// Which [`CORE_TOKENS`] this variant is missing, in order. An empty list
+    /// means it covers the whole reference UI.
     pub fn missing_core_tokens(&self) -> Vec<&'static str> {
         CORE_TOKENS
             .iter()
@@ -91,7 +90,7 @@ impl Variant {
 /// Why a theme package was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThemeError {
-    /// The bytes were not valid JSON in the package shape.
+    /// The bytes weren't valid JSON for a theme package.
     Json(String),
     /// The embedded manifest failed [`Manifest::validate`].
     Manifest(ManifestError),
@@ -99,7 +98,7 @@ pub enum ThemeError {
     NotATheme,
     /// Neither a dark nor a light variant was present.
     NoVariants,
-    /// A present variant defined no colors at all.
+    /// A variant was present but had no colors.
     EmptyVariant(&'static str),
 }
 
@@ -118,8 +117,8 @@ impl core::fmt::Display for ThemeError {
 impl std::error::Error for ThemeError {}
 
 impl ThemePackage {
-    /// Check everything serde cannot: the manifest invariants, that this really
-    /// is a theme, and that it carries at least one non-empty variant.
+    /// Check everything serde can't: the manifest rules, that this really is a
+    /// theme, and that it has at least one variant with colors in it.
     pub fn validate(&self) -> Result<(), ThemeError> {
         self.manifest.validate().map_err(ThemeError::Manifest)?;
         if self.manifest.kind != ExtensionKind::Theme {
@@ -139,8 +138,8 @@ impl ThemePackage {
     }
 }
 
-/// Parse and fully validate a theme package from its JSON bytes. This is the
-/// one entry point a host should use; it never returns an unvalidated package.
+/// Parse and fully validate a theme package from JSON bytes. Hosts should use
+/// this one function; it never hands back a package it hasn't validated.
 pub fn parse_package(bytes: &[u8]) -> Result<ThemePackage, ThemeError> {
     let pkg: ThemePackage =
         serde_json::from_slice(bytes).map_err(|e| ThemeError::Json(e.to_string()))?;

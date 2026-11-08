@@ -1,24 +1,22 @@
-//! The authorized-target loader: it turns a verified [`TargetAdapter`] and a
-//! theme into the concrete memory writes that repaint one GPUI build, and
-//! launches that build with the in-process agent attached.
+//! The loader: it turns a verified [`TargetAdapter`] and a theme into the actual
+//! memory writes that repaint one GPUI build, and launches that build with the
+//! in-process agent attached.
 //!
-//! The loader is split so that almost all of it stays pure and testable, and
-//! the genuinely dangerous part is small and isolated:
+//! It's split so almost all of it stays plain and testable, and the genuinely
+//! dangerous part is small and off to the side:
 //!
-//! * [`preflight`] gates everything on exact identity — it refuses to proceed
-//!   unless the candidate executable's bytes are the ones the adapter was
-//!   authored against.
+//! * [`preflight`] checks exact identity first — it won't go on unless the
+//!   candidate executable's bytes are the ones the adapter was written for.
 //! * [`plan_writes`] turns an adapter + a theme [`Variant`] + the image's load
 //!   base into a list of [`PlannedWrite`]s. It only plans tokens the adapter
-//!   actually supports *and* the theme defines; anything else is skipped, never
-//!   faked.
-//! * [`encode_color`] renders a color into the exact byte form a site expects.
+//!   supports *and* the theme defines; anything else is skipped, not faked.
+//! * [`encode_color`] turns a color into the exact bytes a site expects.
 //! * the `agent` module (feature `frida`) is the only code that writes another
-//!   process's memory; it consumes the plan above and nothing else.
+//!   process's memory; it works only from the plan above.
 //!
-//! Nothing here casts foreign memory into `gpui` types: a stripped, fat-LTO
-//! release binary has no stable Rust layout to borrow, so the loader only ever
-//! touches a single verified color slot at a pinned site.
+//! Nothing here reads the target's memory as `gpui` types: a stripped, fat-LTO
+//! release binary has no stable Rust layout to rely on, so the loader only ever
+//! touches one checked color slot at a fixed spot.
 
 use maycord_target::{ColorEncoding, TargetAdapter, ValueLocation, VerifyError};
 use maycord_theme::{Rgba, Variant};
@@ -26,7 +24,7 @@ use maycord_theme::{Rgba, Variant};
 pub mod agent;
 
 /// A color encoded the way a specific [`PaletteSite`](maycord_target::PaletteSite)
-/// expects to find it in memory.
+/// expects it in memory.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EncodedColor {
     /// Four `f32` channels (16 bytes) — a vector-register or stack `f32x4`.
@@ -36,7 +34,7 @@ pub enum EncodedColor {
 }
 
 impl EncodedColor {
-    /// The little-endian bytes to write for a stack/memory slot. (A register
+    /// The little-endian bytes to write into a stack or memory slot. (A register
     /// write uses the typed value directly instead.)
     pub fn to_le_bytes(self) -> Vec<u8> {
         match self {
@@ -47,12 +45,12 @@ impl EncodedColor {
 }
 
 /// Encode `color` the way `encoding` stores it. This is where a maycord theme
-/// color becomes the bytes a particular build actually paints with, so it must
-/// match the target's own convention exactly or the pixel comes out wrong.
+/// color becomes the bytes a build paints with, so it has to match the target's
+/// own format exactly or the pixel comes out wrong.
 ///
-/// Returns `None` for an encoding this loader build does not understand — a
-/// newer adapter naming a future encoding is refused at that site rather than
-/// written wrong, since [`ColorEncoding`] is non-exhaustive by design.
+/// Returns `None` for an encoding this loader build doesn't know. A newer adapter
+/// that names a future encoding is skipped at that site instead of written
+/// wrong, since [`ColorEncoding`] can grow new variants.
 pub fn encode_color(color: Rgba, encoding: ColorEncoding) -> Option<EncodedColor> {
     Some(match encoding {
         ColorEncoding::StraightSrgbF32 => EncodedColor::F32x4([
@@ -62,8 +60,7 @@ pub fn encode_color(color: Rgba, encoding: ColorEncoding) -> Option<EncodedColor
             color.a as f32 / 255.0,
         ]),
         ColorEncoding::PremultipliedLinearF32 => {
-            // Straight linear channels plus alpha, then premultiply rgb by alpha
-            // — the form GPUI's scene layer blends with.
+            // Linear channels plus alpha, then multiply rgb by alpha (premultiplied).
             let [r, g, b, a] = color.to_linear_f32();
             EncodedColor::F32x4([r * a, g * a, b * a, a])
         }
@@ -77,8 +74,8 @@ pub fn encode_color(color: Rgba, encoding: ColorEncoding) -> Option<EncodedColor
     })
 }
 
-/// One concrete write the agent will perform: at `runtime_addr`, after
-/// confirming `expected_bytes` are still there, place `color` at `location`.
+/// One write the agent will make: at `runtime_addr`, after checking
+/// `expected_bytes` are still there, put `color` at `location`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlannedWrite {
     pub token: String,
@@ -88,14 +85,14 @@ pub struct PlannedWrite {
     pub color: EncodedColor,
 }
 
-/// Build the writes that apply `variant` to the target described by `adapter`,
-/// given the image's `image_base` (preferred base plus ASLR slide, which the
-/// agent reads from the live process).
+/// Build the writes that apply `variant` to the target the `adapter` describes,
+/// given the image's `image_base` (its preferred base plus the ASLR shift, which
+/// the agent reads from the running process).
 ///
 /// A write is planned only when the adapter has a site for the token *and* the
-/// variant defines a color for it. Tokens the adapter cannot paint, or the
-/// theme leaves unset, are simply absent from the plan — the loader never
-/// pretends to apply a color it has nowhere to put.
+/// variant defines a color for it. Tokens the adapter can't paint, or the theme
+/// leaves unset, just aren't in the plan — the loader never pretends to apply a
+/// color it has nowhere to put.
 pub fn plan_writes(adapter: &TargetAdapter, variant: &Variant, image_base: u64) -> Vec<PlannedWrite> {
     adapter
         .sites
@@ -114,22 +111,22 @@ pub fn plan_writes(adapter: &TargetAdapter, variant: &Variant, image_base: u64) 
         .collect()
 }
 
-/// Gate on exact identity: confirm `exe_bytes` are the build `adapter` was
-/// authored against, and that the adapter is internally coherent. The loader
-/// calls this before it launches or touches the target; on any error it must
-/// not proceed.
+/// Check exact identity: confirm `exe_bytes` are the build the `adapter` was
+/// written for, and that the adapter itself makes sense. The loader calls this
+/// before it launches or touches the target; on any error it must stop.
 pub fn preflight(exe_bytes: &[u8], adapter: &TargetAdapter) -> Result<(), VerifyError> {
     adapter.validate()?;
     adapter.identity.verify_file(exe_bytes)
 }
 
-/// macOS launch: verify the target on disk, then start it with the agent dylib
-/// forced in via `DYLD_INSERT_LIBRARIES` and the adapter handed over by path.
+/// macOS launch: check the target on disk, then start it with the agent dylib
+/// forced in via `DYLD_INSERT_LIBRARIES` and the adapter passed by path.
 ///
-/// This works against an unsigned or ad-hoc-signed copy of the target; a
+/// This works on an unsigned or ad-hoc-signed copy of the target. A
 /// hardened-runtime, library-validated binary ignores `DYLD_INSERT_LIBRARIES`
-/// unless it carries the matching entitlement, which is a property of the target
-/// we cannot grant it. The loader reports that rather than pretending to inject.
+/// unless it has the matching entitlement, which is the target's own setting and
+/// not something we can grant it. The loader reports that instead of pretending
+/// to inject.
 #[cfg(target_os = "macos")]
 pub fn launch_macos(
     exe: &std::path::Path,

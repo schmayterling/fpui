@@ -1,12 +1,13 @@
 //! The in-process agent: the code that runs *inside* the target once the loader
-//! has forced this crate's dylib in. It reads the adapter and theme the loader
-//! handed over, finds where the target was mapped, confirms the pinned
-//! instruction bytes are really present, and then applies the planned writes.
+//! has forced this crate's dylib into it. It reads the adapter and theme the
+//! loader handed over, finds where the target was loaded in memory, checks that
+//! the pinned instruction bytes are really there, and then makes the planned
+//! writes.
 //!
-//! Everything here up to [`apply`] is verification: it reads, compares, and
-//! refuses, so it is safe to run even against the wrong process. [`apply`] is
-//! the only step that rewrites the target's execution, via a frida-gum
-//! instruction probe behind the `frida` feature.
+//! Everything up to [`apply`] only reads, compares, and refuses, so it's safe to
+//! run even against the wrong process. [`apply`] is the only step that changes
+//! the target's running code, through a frida-gum instruction probe behind the
+//! `frida` feature.
 
 use std::io;
 
@@ -50,8 +51,8 @@ pub fn pick_variant(package: &ThemePackage) -> io::Result<&Variant> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "theme has no usable variant"))
 }
 
-/// A site whose pinned bytes were not present: the running build is not the one
-/// the adapter was authored against, so the agent must not write.
+/// A site whose pinned bytes weren't there: the running build isn't the one the
+/// adapter was written for, so the agent must not write.
 #[derive(Clone, Debug)]
 pub struct SiteMismatch {
     pub token: String,
@@ -68,15 +69,15 @@ impl core::fmt::Display for SiteMismatch {
     }
 }
 
-/// Confirm every site still holds its pinned instruction bytes before any write.
-/// Running in-process, each site's runtime address is directly readable.
+/// Check every site still has its pinned instruction bytes before any write.
+/// Since we're inside the process, each site's address is readable directly.
 pub fn verify_sites(plan: &[PlannedWrite]) -> Result<(), SiteMismatch> {
     for write in plan {
         // SAFETY: `runtime_addr` is this image's verified load base plus an
-        // offset from an identity-checked adapter; we read exactly
-        // `expected_bytes.len()` bytes to compare and never write here. A wrong
-        // address is the failure this check exists to catch, not to cause — it
-        // is only reached after the loader's full-file identity gate passed.
+        // offset from an identity-checked adapter. We read exactly
+        // `expected_bytes.len()` bytes to compare and never write. A wrong
+        // address is what this check is meant to catch, and we only get here
+        // after the loader's whole-file identity check passed.
         let actual = unsafe {
             std::slice::from_raw_parts(write.runtime_addr as *const u8, write.expected_bytes.len())
         };
@@ -90,18 +91,18 @@ pub fn verify_sites(plan: &[PlannedWrite]) -> Result<(), SiteMismatch> {
     Ok(())
 }
 
-/// Install the color writes: the one step that rewrites the target's execution.
+/// Make the color writes: the one step that changes the target's running code.
 ///
-/// With the `frida` feature (and on macOS) this attaches a frida-gum probe at
-/// each verified site that overwrites the live color. Without it, the agent
-/// still verifies everything and then reports that the write backend is absent —
-/// so a build without `frida` never silently pretends to patch.
+/// With the `frida` feature (and on macOS), this attaches a frida-gum probe at
+/// each checked site that overwrites the live color. Without it, the agent still
+/// verifies everything and then reports that the write backend isn't built in —
+/// so a build without `frida` never quietly pretends to patch.
 #[cfg(all(target_os = "macos", feature = "frida"))]
 pub fn apply(plan: &[PlannedWrite]) -> io::Result<()> {
     frida_backend::apply(plan)
 }
 
-/// Fallback when the write backend is not compiled in.
+/// Used when the write backend isn't compiled in.
 #[cfg(not(all(target_os = "macos", feature = "frida")))]
 pub fn apply(_plan: &[PlannedWrite]) -> io::Result<()> {
     Err(io::Error::new(
@@ -120,8 +121,8 @@ mod frida_backend {
 
     use crate::{EncodedColor, PlannedWrite};
 
-    /// A probe bound to one site: when execution reaches the pinned instruction,
-    /// it overwrites the live color register before that instruction runs.
+    /// A probe tied to one site: when execution reaches the pinned instruction,
+    /// it overwrites the color register before that instruction runs.
     struct ColorProbe {
         reg: usize,
         value: u64,
@@ -130,18 +131,18 @@ mod frida_backend {
     impl ProbeListener for ColorProbe {
         fn on_hit(&mut self, context: InvocationContext) {
             let mut cpu = context.cpu_context();
-            // Only reached for sites apply() already checked, so this cannot be
-            // a read-only context or an out-of-range register.
+            // apply() already checked this site, so the context is writable and
+            // the register number is in range.
             if cpu.set_reg(self.reg, self.value).is_err() {
                 debug_assert!(false, "probe cpu context was unexpectedly read-only");
             }
         }
     }
 
-    /// What this backend can write today: a packed `u32` color in a general
-    /// register `x0..x28`. Vector-register (`f32x4`) and stack writes are
-    /// expressible in an adapter but not yet applied here; such a site is
-    /// rejected up front rather than attached to and silently ignored.
+    /// What this backend can write today: a packed `u32` color into a general
+    /// register `x0..x28`. Vector-register (`f32x4`) and stack writes can be
+    /// described in an adapter but aren't done here yet; such a site is rejected
+    /// up front instead of attached to and quietly ignored.
     fn probe_for(write: &PlannedWrite) -> io::Result<ColorProbe> {
         match (write.location, write.color) {
             (ValueLocation::General(n), EncodedColor::U32(word)) if (n as usize) < 29 => {
@@ -167,8 +168,8 @@ mod frida_backend {
         let gum = Gum::obtain();
         let mut interceptor = Interceptor::obtain(&gum);
         for (write, probe) in plan.iter().zip(probes) {
-            // Leak the probe so its vtable outlives this call for the process's
-            // lifetime; a mod stays attached until the process exits.
+            // Leak the probe so it lives for the rest of the process; a mod stays
+            // attached until the process exits.
             let probe = Box::leak(Box::new(probe));
             let address = NativePointer(write.runtime_addr as *mut core::ffi::c_void);
             interceptor
@@ -181,16 +182,16 @@ mod frida_backend {
     }
 }
 
-/// The load base of the main executable image (its preferred base plus the ASLR
-/// slide). We cannot assume image index 0: an inserted library (the agent
-/// itself, via `DYLD_INSERT_LIBRARIES`) can take index 0, so we find the image
-/// whose Mach-O filetype is `MH_EXECUTE` instead.
+/// Where the main executable is loaded in memory (its preferred base plus the
+/// ASLR shift). We can't assume image index 0: an inserted library (the agent
+/// itself, via `DYLD_INSERT_LIBRARIES`) can take index 0, so we look for the
+/// image whose Mach-O filetype is `MH_EXECUTE` instead.
 #[cfg(target_os = "macos")]
 #[allow(deprecated)] // libc prefers the mach2 crate's binding; the dyld API itself is stable.
 pub fn main_image_base() -> Option<u64> {
     const MH_EXECUTE: u32 = 0x2;
-    // SAFETY: the dyld image APIs are defined for indices in `0..count`; each
-    // header pointer is a readable `mach_header_64`, whose `filetype` is the 4th
+    // SAFETY: the dyld image calls are valid for indices in `0..count`. Each
+    // header points to a readable `mach_header_64`, whose `filetype` is the 4th
     // `u32` (byte offset 12). We only read it.
     unsafe {
         let count = libc::_dyld_image_count();
@@ -208,8 +209,9 @@ pub fn main_image_base() -> Option<u64> {
     }
 }
 
-/// Run the whole agent flow once: load adapter + theme, locate the image, plan,
-/// verify, apply. Called from the agent dylib's module-init constructor.
+/// Run the whole agent once: load the adapter and theme, find the image, build
+/// the plan, verify it, and apply. Called from the agent dylib's startup
+/// constructor.
 #[cfg(target_os = "macos")]
 pub fn run() -> io::Result<()> {
     let adapter = adapter_from_env()?;
@@ -285,7 +287,7 @@ mod tests {
 
     #[test]
     fn adapter_from_env_errors_without_the_var() {
-        // Not set in this test's environment (never set here): a clean NotFound.
+        // MAYCORD_ADAPTER isn't set here, so we expect a clean NotFound.
         if std::env::var_os("MAYCORD_ADAPTER").is_none() {
             assert_eq!(
                 adapter_from_env().unwrap_err().kind(),

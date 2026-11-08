@@ -1,84 +1,84 @@
-//! The manifest every maycord extension ships with.
+//! The manifest that ships with every maycord extension.
 //!
-//! A manifest is pure metadata: it names a package, declares whether it is a
-//! [`Theme`](ExtensionKind::Theme) or a [`Plugin`](ExtensionKind::Plugin), and
-//! lists the [`Capability`] grants a plugin needs. It is not an invocation and
-//! not a permission grant on its own — the host still asks the user to consent
-//! to each capability before loading code. Serde checks the document shape;
-//! [`Manifest::validate`] checks the parts serde cannot.
+//! A manifest is just metadata. It gives the package a name, says whether the
+//! package is a [`Theme`](ExtensionKind::Theme) or a
+//! [`Plugin`](ExtensionKind::Plugin), and lists the [`Capability`] permissions a
+//! plugin asks for. Listing a capability does not grant it: the host still asks
+//! the user to approve each one before any code runs. Serde checks that the JSON
+//! has the right shape; [`Manifest::validate`] checks the rules serde can't.
 
 use serde::{Deserialize, Serialize};
 
 /// The manifest schema version this crate reads and writes.
 pub const API_VERSION: u32 = 1;
 
-/// Package metadata shared by hosts (which load packages) and tooling (which
-/// builds and verifies them).
+/// Package metadata. Hosts read it to load a package; packaging tools write and
+/// check it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Schema version of this manifest; must equal [`API_VERSION`].
     pub api_version: u32,
-    /// Stable, unique identifier, e.g. `maycord-ocean`. Never changes across versions.
+    /// Stable, unique id, like `maycord-ocean`. Never changes between versions.
     pub id: String,
     /// Human-readable name shown in the extension list.
     pub name: String,
-    /// Package version, semver recommended. Bumped on any change to the package.
+    /// Package version, ideally semver. Bump it on any change to the package.
     pub version: String,
-    /// Author or maintainer label.
+    /// Author or maintainer name.
     pub author: String,
-    /// SPDX license expression for the package contents.
+    /// SPDX license string for the package contents.
     pub license: String,
-    /// Canonical source URL for the package.
+    /// Where the package comes from (its canonical URL).
     pub source: String,
     /// Whether this package is a theme or a plugin.
     pub kind: ExtensionKind,
-    /// Capabilities a plugin requests. Themes leave this empty.
+    /// Capabilities a plugin asks for. Themes leave this empty.
     #[serde(default)]
     pub capabilities: Vec<Capability>,
 }
 
-/// What a package contributes to the client.
+/// What a package adds to the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtensionKind {
-    /// Declarative appearance only: a color-token map, no code. Needs no capabilities.
+    /// Appearance only: a map of color tokens, no code. Needs no capabilities.
     Theme,
-    /// Executable logic delivered as a sandboxed WebAssembly module.
+    /// Code, shipped as a sandboxed WebAssembly module.
     Plugin,
 }
 
-/// A permission a plugin must request in its manifest and the user must grant
-/// before the plugin is loaded. Themes never carry capabilities.
+/// A permission a plugin requests in its manifest and the user approves before
+/// the plugin loads. Themes never have capabilities.
 ///
-/// The set is intentionally small for v1 and grows additively; older hosts
-/// reject a capability they do not recognize rather than silently ignoring it.
+/// The list is deliberately small and only grows over time. An older host that
+/// doesn't recognize a capability rejects the plugin rather than ignoring it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Capability {
-    /// Read or transform the text of messages the client renders.
+    /// Read or change the text of messages the client shows.
     MessageContent,
-    /// Read or rewrite the user's draft before it is sent.
+    /// Read or change the user's draft before it is sent.
     Composer,
-    /// Persist and read the plugin's own key/value storage.
+    /// Save and read the plugin's own key/value data.
     Storage,
-    /// Contribute colors or styling beyond a static theme package.
+    /// Add colors or styling beyond a plain theme package.
     Appearance,
-    /// Observe lifecycle and UI events the host emits.
+    /// Watch lifecycle and UI events the host sends out.
     Events,
 }
 
 /// Why a [`Manifest`] was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManifestError {
-    /// `api_version` did not match [`API_VERSION`].
+    /// `api_version` didn't match [`API_VERSION`].
     UnsupportedApiVersion { found: u32, expected: u32 },
     /// A required text field was empty.
     EmptyField(&'static str),
-    /// `id` contained characters outside `[a-z0-9._-]` or was the wrong length.
+    /// `id` had characters outside `[a-z0-9._-]`, or was the wrong length.
     InvalidId,
-    /// A theme declared capabilities, which it must not.
+    /// A theme listed capabilities, which it isn't allowed to do.
     ThemeWithCapabilities,
     /// The same capability was listed more than once.
     DuplicateCapability(Capability),
@@ -105,8 +105,8 @@ impl core::fmt::Display for ManifestError {
 impl std::error::Error for ManifestError {}
 
 impl Manifest {
-    /// Check the invariants serde cannot express. Call this before trusting a
-    /// parsed manifest; a host that skips it may load a malformed package.
+    /// Check the rules serde can't express. Call this before trusting a parsed
+    /// manifest; a host that skips it may load a broken package.
     pub fn validate(&self) -> Result<(), ManifestError> {
         if self.api_version != API_VERSION {
             return Err(ManifestError::UnsupportedApiVersion {

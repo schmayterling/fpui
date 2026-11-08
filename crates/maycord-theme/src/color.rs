@@ -1,13 +1,14 @@
-//! A small, exact sRGB color with 8-bit channels, parsed from CSS-style hex.
+//! A small, exact sRGB color with 8-bit channels, parsed from a CSS-style hex
+//! string.
 //!
-//! Themes are authored as hex strings, so this is the one place a theme's text
-//! becomes numbers. It accepts `#RGB`, `#RGBA`, `#RRGGBB`, and `#RRGGBBAA`
-//! (case-insensitive), the forms a theme author actually writes, and nothing
-//! else — an unknown form is an error, not a silent default.
+//! Themes are written as hex strings, so this is where a theme's text turns into
+//! numbers. It accepts the forms people actually write — `#RGB`, `#RGBA`,
+//! `#RRGGBB`, and `#RRGGBBAA`, in any case — and nothing else. Anything else is
+//! an error, not a silent fallback.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// A straight (non-premultiplied) sRGB color with an alpha channel.
+/// An sRGB color plus an alpha channel. Not premultiplied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgba {
     pub r: u8,
@@ -21,7 +22,7 @@ pub struct Rgba {
 pub enum ParseColorError {
     /// The string did not start with `#`.
     MissingHash,
-    /// The digit count after `#` was not 3, 4, 6, or 8.
+    /// There weren't 3, 4, 6, or 8 hex digits after `#`.
     BadLength(usize),
     /// A character after `#` was not a hex digit.
     BadDigit(char),
@@ -42,13 +43,13 @@ impl core::fmt::Display for ParseColorError {
 impl std::error::Error for ParseColorError {}
 
 impl Rgba {
-    /// Fully opaque color from its channels.
+    /// Build a fully opaque color from its channels.
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 0xff }
     }
 
-    /// Parse a CSS-style hex color. Short forms are expanded by digit doubling,
-    /// so `#1a2` becomes `#11aa22`, matching how browsers read `#rgb`.
+    /// Parse a CSS-style hex color. Short forms double each digit, so `#1a2`
+    /// means `#11aa22`, the same way browsers read `#rgb`.
     pub fn parse(s: &str) -> Result<Self, ParseColorError> {
         let hex = s.strip_prefix('#').ok_or(ParseColorError::MissingHash)?;
         if let Some(c) = hex.chars().find(|c| !c.is_ascii_hexdigit()) {
@@ -56,7 +57,7 @@ impl Rgba {
         }
         let nib = |c: u8| (c as char).to_digit(16).unwrap() as u8;
         let bytes = hex.as_bytes();
-        // Each channel is either one nibble (doubled) or two nibbles (a full byte).
+        // Each channel is one hex digit (doubled) or two (a full byte).
         let (chan, has_alpha) = match hex.len() {
             3 => (1usize, false),
             4 => (1, true),
@@ -80,7 +81,7 @@ impl Rgba {
         })
     }
 
-    /// Linear-space f32 channels in `0.0..=1.0`, the form a GPU renderer wants.
+    /// The color as linear f32 channels in `0.0..=1.0`, the form a GPU wants.
     pub fn to_linear_f32(self) -> [f32; 4] {
         [
             srgb_to_linear(self.r),
@@ -91,7 +92,7 @@ impl Rgba {
     }
 }
 
-/// One sRGB 8-bit channel to a linear f32, per the sRGB transfer function.
+/// Convert one 8-bit sRGB channel to a linear f32, using the sRGB formula.
 fn srgb_to_linear(c: u8) -> f32 {
     let c = c as f32 / 255.0;
     if c <= 0.04045 {
@@ -102,7 +103,8 @@ fn srgb_to_linear(c: u8) -> f32 {
 }
 
 impl core::fmt::Display for Rgba {
-    /// `#RRGGBB` when opaque, `#RRGGBBAA` otherwise, so a round trip keeps alpha.
+    /// Prints `#RRGGBB` when opaque and `#RRGGBBAA` otherwise, so alpha survives
+    /// a round trip.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.a == 0xff {
             write!(f, "#{:02x}{:02x}{:02x}", self.r, self.g, self.b)

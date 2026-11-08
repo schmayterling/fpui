@@ -1,32 +1,33 @@
-//! The per-target adapter: the one stable interface maycord implements for each
-//! GPUI application it patches.
+//! The per-target adapter: the one stable thing maycord writes for each GPUI
+//! app it patches.
 //!
-//! A shipped GPUI client is release machine code — fat LTO, `codegen-units = 1`,
-//! `strip = "symbols"`. It exposes no stable symbol and no stable ABI (Rust's
-//! type layout is explicitly not guaranteed), so there is nothing durable to
-//! link against. The *only* durable handle on such a binary is its exact bytes.
+//! A shipped GPUI client is release machine code — built with fat LTO, one
+//! codegen unit, and symbols stripped. It has no stable symbol names and no
+//! stable memory layout (Rust doesn't promise one), so there's nothing reliable
+//! to link against. The only reliable handle on such a binary is its exact
+//! bytes.
 //!
-//! maycord therefore pins every patch to an exact executable identity and to
-//! exact instruction bytes at an image-relative address. Supporting a new GPUI
-//! app — a future GPUI-based client included — means authoring a
+//! So maycord pins every patch to one exact executable and to the exact
+//! instruction bytes at a fixed offset in it. Adding support for a new GPUI app
+//! — including a future GPUI-based client — just means writing a
 //! [`TargetAdapter`]: its [`TargetIdentity`] plus the [`PaletteSite`]s where
-//! that specific build materializes a color. An adapter is *data*, so a new
-//! target needs no maycord code change; it ships as, say, JSON.
+//! that specific build builds a color. An adapter is plain data, so a new target
+//! needs no code change in maycord; it can ship as JSON.
 //!
-//! The division of trust is deliberate. This crate is pure and safe: it
-//! describes a target and verifies a file against an identity. The unsafe,
-//! per-OS work — mapping the process, re-checking the expected bytes at the
-//! ASLR-slid runtime address, writing the color — lives in the loader, which
-//! must not patch without a [`TargetIdentity::verify_file`] pass and a live
-//! byte match first. An unknown image or a single mismatched byte means *no
-//! patch*. An adapter only ever claims the tokens it can actually paint; an
-//! unsupported request is rejected, never silently faked.
+//! The split of responsibility is on purpose. This crate is pure and safe: it
+//! describes a target and checks a file against an identity. The unsafe, per-OS
+//! work — mapping the process, re-checking the expected bytes at the real
+//! (ASLR-shifted) address, and writing the color — lives in the loader, which
+//! won't patch until [`TargetIdentity::verify_file`] passes and the live bytes
+//! match. An unknown file, or a single wrong byte, means no patch. An adapter
+//! only claims the tokens it can really paint; a request for anything else is
+//! rejected, not quietly ignored.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// The instruction-set the target image was compiled for. A site's bytes and
-/// value locations are only meaningful under the matching architecture.
+/// The CPU architecture the target was built for. A site's bytes and register
+/// locations only make sense for the matching architecture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -35,9 +36,9 @@ pub enum Arch {
     X86_64,
 }
 
-/// A platform's native image identity, cross-checked in addition to the file
-/// hash. Only the variant for the current proof target (macOS) exists today;
-/// Linux build-ids and Windows PDB signatures are added as those loaders land.
+/// A platform's own id for a binary, checked alongside the file hash. Only the
+/// macOS variant exists today; Linux build-ids and Windows PDB signatures get
+/// added when those loaders land.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -46,23 +47,22 @@ pub enum ImageId {
     MachUuid([u8; 16]),
 }
 
-/// How the live color is represented at a [`PaletteSite`]. The loader must
-/// encode the replacement color the same way the target expects, or it writes
-/// garbage.
+/// How the color is stored at a [`PaletteSite`]. The loader has to encode the
+/// replacement color the same way the target does, or it writes garbage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ColorEncoding {
     /// Four straight (non-premultiplied) sRGB `f32` channels, `0.0..=1.0`.
     StraightSrgbF32,
-    /// Four premultiplied linear `f32` channels, as GPUI's scene layer uses.
+    /// Four premultiplied linear `f32` channels, `0.0..=1.0`.
     PremultipliedLinearF32,
     /// A single `0xRRGGBBAA` word.
     SrgbU32,
 }
 
-/// Where the live color sits when control reaches a [`PaletteSite`]. Register
-/// numbers are architecture-relative (e.g. `Vector(8)` is `v8` on aarch64).
+/// Where the color sits when execution reaches a [`PaletteSite`]. Register
+/// numbers are per-architecture (e.g. `Vector(8)` is `v8` on aarch64).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -75,40 +75,38 @@ pub enum ValueLocation {
     Stack { offset: i64 },
 }
 
-/// One place in a specific build where a palette color is materialized, and
-/// everything the loader needs to verify it and rewrite that one color.
+/// One spot in a specific build where a color is built, plus everything the
+/// loader needs to check that spot and rewrite that one color.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaletteSite {
-    /// The maycord semantic token this site paints (e.g. `"sidebar"`).
+    /// The maycord token this site paints (e.g. `"sidebar"`).
     pub token: String,
-    /// Image-relative address of the probe instruction (not a file offset); the
-    /// loader adds the ASLR slide to get the runtime address.
+    /// Offset of the probe instruction within the image (not a file offset). The
+    /// loader adds the ASLR shift to get the real runtime address.
     pub image_offset: u64,
-    /// The exact instruction bytes expected at `image_offset`. The loader
-    /// re-reads these from the mapped image and refuses to patch on any
-    /// mismatch, so a build the adapter was not authored against cannot be
-    /// silently mispatched.
+    /// The exact instruction bytes expected at `image_offset`. The loader reads
+    /// these back from the running image and refuses to patch if they don't
+    /// match, so it can't patch the wrong build by mistake.
     #[serde(with = "hex_bytes")]
     pub expected_bytes: Vec<u8>,
     /// How the color is encoded at this site.
     pub encoding: ColorEncoding,
-    /// Where the live color value is when the probe fires.
+    /// Where the color value is when the probe fires.
     pub location: ValueLocation,
 }
 
 impl PaletteSite {
-    /// The runtime address of the probe given the image's load base (the base
-    /// the OS mapped the image at, i.e. preferred base plus ASLR slide).
+    /// The real runtime address of the probe, given where the OS loaded the
+    /// image (its preferred base plus the ASLR shift).
     pub fn runtime_addr(&self, image_base: u64) -> u64 {
         image_base.wrapping_add(self.image_offset)
     }
 }
 
-/// The exact identity of one executable build. A full-file SHA-256 match means
-/// the bytes are identical, so architecture, image id, and every site's
-/// expected bytes necessarily hold too; the extra fields let the loader report
-/// a precise reason and re-check identity against a mapped image, where the
-/// file hash is not available.
+/// The exact identity of one build. If the whole-file SHA-256 matches, the bytes
+/// are identical, so the architecture, image id, and every site's expected bytes
+/// all hold too. The extra fields let the loader give a precise reason and
+/// re-check identity against the running image, where it can't hash the file.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetIdentity {
     pub arch: Arch,
@@ -118,8 +116,8 @@ pub struct TargetIdentity {
 }
 
 impl TargetIdentity {
-    /// Verify a candidate executable's bytes are exactly this identity. This is
-    /// the gate the loader runs before it launches or touches the target.
+    /// Check that a candidate executable's bytes are exactly this identity. The
+    /// loader runs this before it launches or touches the target.
     pub fn verify_file(&self, exe_bytes: &[u8]) -> Result<(), VerifyError> {
         let found = sha256(exe_bytes);
         if found != self.sha256 {
@@ -132,14 +130,14 @@ impl TargetIdentity {
     }
 }
 
-/// Why a target failed verification or an adapter was malformed.
+/// Why a target failed its check, or an adapter was malformed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
     /// The candidate file's hash did not match the pinned identity.
     Sha256Mismatch { expected: [u8; 32], found: [u8; 32] },
-    /// The adapter declared no palette sites, so it can paint nothing.
+    /// The adapter listed no palette sites, so it can paint nothing.
     NoSites,
-    /// Two sites claimed the same token; the mapping would be ambiguous.
+    /// Two sites claimed the same token, so which one wins is ambiguous.
     DuplicateToken(String),
 }
 
@@ -160,13 +158,12 @@ impl core::fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-/// A complete, exact-identity description of how to repaint one GPUI build:
-/// which executable it is and where that executable materializes each color.
-/// Authoring one of these — and nothing else — is how maycord gains support for
-/// a new GPUI application.
+/// A complete, exact description of how to repaint one GPUI build: which
+/// executable it is and where that build builds each color. Writing one of these
+/// — and nothing else — is how maycord gains support for a new GPUI app.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetAdapter {
-    /// Human label for diagnostics, e.g. `"example-client 1.2.0 (macos arm64)"`.
+    /// A label for logs, e.g. `"example-client 1.2.0 (macos arm64)"`.
     pub name: String,
     /// The exact build this adapter is pinned to.
     pub identity: TargetIdentity,
@@ -175,8 +172,8 @@ pub struct TargetAdapter {
 }
 
 impl TargetAdapter {
-    /// Check the adapter is internally coherent: it has at least one site and no
-    /// two sites fight over the same token. Call once when an adapter is loaded,
+    /// Check the adapter makes sense on its own: it has at least one site and no
+    /// two sites claim the same token. Call this once when loading an adapter,
     /// before trusting [`site`](Self::site) or [`supports`](Self::supports).
     pub fn validate(&self) -> Result<(), VerifyError> {
         if self.sites.is_empty() {
@@ -195,13 +192,13 @@ impl TargetAdapter {
         self.sites.iter().find(|s| s.token == token)
     }
 
-    /// Whether this adapter can paint `token`. A request for a token with no
-    /// site must be rejected by the caller, not silently ignored.
+    /// Whether this adapter can paint `token`. If there's no site for a token,
+    /// the caller should reject the request, not quietly ignore it.
     pub fn supports(&self, token: &str) -> bool {
         self.site(token).is_some()
     }
 
-    /// Every token this adapter can paint, in declared order.
+    /// Every token this adapter can paint, in listed order.
     pub fn supported_tokens(&self) -> impl Iterator<Item = &str> {
         self.sites.iter().map(|s| s.token.as_str())
     }
@@ -234,7 +231,7 @@ fn unhex(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Serialize `Vec<u8>` as a hex string instead of a JSON number array, so an
+/// Serialize `Vec<u8>` as a hex string instead of a JSON array of numbers, so an
 /// adapter's instruction bytes read like a disassembler dump.
 mod hex_bytes {
     use serde::{Deserialize, Deserializer, Serializer};

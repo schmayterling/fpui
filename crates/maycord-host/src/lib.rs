@@ -1,29 +1,29 @@
-//! The host side of maycord: it loads plugins and runs them against a small,
-//! capability-gated hook surface.
+//! The host side of maycord: it loads plugins and runs them against a small set
+//! of hooks, each guarded by a capability.
 //!
-//! A plugin never touches the client directly. It implements [`Plugin`] and the
-//! host reaches it only through hooks the plugin was *granted* a [`Capability`]
+//! A plugin never touches the client directly. It implements [`Plugin`], and the
+//! host only calls a hook the plugin was *granted* the matching [`Capability`]
 //! for. There are two kinds of hook:
 //!
-//! * **observe** — [`Plugin::on_event`] is handed an [`Event`] the plugin may
-//!   react to but not change. Gated by [`Capability::Events`].
+//! * **observe** — [`Plugin::on_event`] gets an [`Event`] the plugin can react
+//!   to but not change. Needs [`Capability::Events`].
 //! * **transform** — [`Plugin::transform_message`] and
-//!   [`Plugin::transform_draft`] are handed content the plugin may rewrite in
-//!   place, and the host uses the result. Gated by
-//!   [`Capability::MessageContent`] and [`Capability::Composer`].
+//!   [`Plugin::transform_draft`] get content the plugin can rewrite in place,
+//!   and the host uses the result. Need [`Capability::MessageContent`] and
+//!   [`Capability::Composer`].
 //!
-//! The host is the single place a capability is enforced: a plugin that was not
-//! granted a capability is never invoked through that hook, whatever it
-//! implements. This crate is a pure, safe *reference* host. A sandboxed
-//! WebAssembly host — where the boundary is enforced by the runtime refusing a
-//! host call, not by the host declining to make one — implements the same
-//! [`Plugin`] contract across the wasm edge, so the hook model is identical
-//! whether a plugin is native or wasm.
+//! The host is the only place a capability is checked: if a plugin wasn't
+//! granted one, the host simply never calls that hook, no matter what the plugin
+//! implements. This crate is a plain, safe *reference* host. A sandboxed
+//! WebAssembly host enforces the same boundary a different way — the runtime
+//! refuses a host call instead of the host declining to make one — but it
+//! implements the same [`Plugin`] trait, so the hooks work the same whether a
+//! plugin is native or wasm.
 //!
-//! What a plugin is *granted* is a subset of what its manifest *requests*: the
-//! manifest is the plugin's ask, and [`Host::register`] takes the capabilities
-//! the user actually consented to. Granting a capability the manifest never
-//! requested is rejected, so consent can only narrow the ask, never widen it.
+//! What a plugin is *granted* is a subset of what its manifest *asks for*: the
+//! manifest is the request, and [`Host::register`] takes the capabilities the
+//! user actually approved. Granting a capability the manifest never asked for is
+//! rejected, so approval can only shrink the request, never grow it.
 //!
 //! ```
 //! use maycord_host::{Host, Message, Plugin};
@@ -55,57 +55,55 @@ use std::collections::BTreeSet;
 
 use maycord_manifest::{Capability, ExtensionKind, Manifest, ManifestError};
 
-/// Something that happened in the client that a plugin may observe. Observing
-/// requires [`Capability::Events`]. The set is deliberately small and grows
-/// additively as the client grows.
+/// Something that happened in the client that a plugin can watch. Watching needs
+/// [`Capability::Events`]. The list is small on purpose and grows over time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event {
     /// The host finished loading every plugin and the client is ready.
     Ready,
-    /// A message became visible in the current channel, identified by its
-    /// `author` only. This is an [`Events`](Capability::Events) signal, so it
-    /// deliberately carries no message text: reading or transforming content
-    /// requires [`Capability::MessageContent`] through
-    /// [`Plugin::transform_message`]. Observing presence must never become a
-    /// backdoor to content a plugin was not granted.
+    /// A message showed up in the current channel. This carries the `author`
+    /// only, not the text: it's an [`Events`](Capability::Events) signal, and
+    /// reading or changing message text needs [`Capability::MessageContent`] via
+    /// [`Plugin::transform_message`] instead. Watching for messages must not be a
+    /// way to read text the plugin wasn't granted.
     MessageDisplayed { author: String },
-    /// The client is shutting down; the plugin's last chance to flush state.
+    /// The client is shutting down; the plugin's last chance to save state.
     Shutdown,
 }
 
-/// A message the client is about to render. A [`Capability::MessageContent`]
-/// plugin may rewrite [`content`](Self::content) in place; [`author`](Self::author)
-/// is context for that decision and is never read back by the host.
+/// A message the client is about to show. A [`Capability::MessageContent`]
+/// plugin can rewrite [`content`](Self::content) in place; [`author`](Self::author)
+/// is there for context and the host never reads it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub author: String,
     pub content: String,
 }
 
-/// The user's unsent draft. A [`Capability::Composer`] plugin may rewrite
+/// The user's unsent draft. A [`Capability::Composer`] plugin can rewrite
 /// [`text`](Self::text) in place before the client sends it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Draft {
     pub text: String,
 }
 
-/// The behavior a plugin contributes. Every method defaults to a no-op, so a
-/// plugin implements only the hooks it wants. Implementing a hook the plugin
-/// was not granted has no effect, because the host never calls it.
+/// What a plugin does. Every method does nothing by default, so a plugin only
+/// implements the hooks it cares about. Implementing a hook the plugin wasn't
+/// granted does nothing, because the host never calls it.
 pub trait Plugin {
     /// React to an observed [`Event`]. Requires [`Capability::Events`].
     fn on_event(&mut self, event: &Event) {
         let _ = event;
     }
 
-    /// Rewrite an incoming message before it renders. Requires
+    /// Rewrite an incoming message before it's shown. Requires
     /// [`Capability::MessageContent`].
     fn transform_message(&mut self, message: &mut Message) {
         let _ = message;
     }
 
-    /// Rewrite the user's draft before it is sent. Requires
+    /// Rewrite the user's draft before it's sent. Requires
     /// [`Capability::Composer`].
     fn transform_draft(&mut self, draft: &mut Draft) {
         let _ = draft;
@@ -117,10 +115,10 @@ pub trait Plugin {
 pub enum HostError {
     /// The manifest failed [`Manifest::validate`].
     Manifest(ManifestError),
-    /// The manifest declared a theme; only plugins are registered with a host.
+    /// The manifest was a theme; only plugins are registered with a host.
     NotAPlugin,
-    /// A capability was granted that the manifest never requested. Consent may
-    /// only narrow the manifest's request, so this is always a caller bug.
+    /// A capability was granted that the manifest never asked for. Approval can
+    /// only shrink the request, so this is always a caller bug.
     UngrantedCapability(Capability),
     /// Another registered plugin already uses this id.
     DuplicateId(String),
@@ -148,11 +146,11 @@ struct Registered {
     plugin: Box<dyn Plugin>,
 }
 
-/// Loads plugins and runs them against the hook surface, enforcing that each
-/// plugin is only ever reached through a hook it was granted.
+/// Loads plugins and runs them through the hooks, making sure each plugin is
+/// only reached through a hook it was granted.
 ///
-/// Hooks run in registration order, so a transform pipeline is deterministic:
-/// the first plugin registered sees the original content, the next sees the
+/// Hooks run in the order plugins were registered, so a chain of transforms is
+/// predictable: the first plugin sees the original content, the next sees the
 /// first's output, and so on.
 #[derive(Default)]
 pub struct Host {
@@ -165,7 +163,7 @@ impl Host {
         Self::default()
     }
 
-    /// Register a plugin. `granted` is the capability set the user consented to;
+    /// Register a plugin. `granted` is the set of capabilities the user approved;
     /// it must be a subset of `manifest.capabilities`. The manifest must pass
     /// [`Manifest::validate`] and must be a [`plugin`](ExtensionKind::Plugin).
     pub fn register(
@@ -204,14 +202,14 @@ impl Host {
         self.plugins.is_empty()
     }
 
-    /// Deliver an observed event to every plugin granted [`Capability::Events`],
-    /// in registration order.
+    /// Send an event to every plugin granted [`Capability::Events`], in
+    /// registration order.
     pub fn broadcast(&mut self, event: &Event) {
         self.each_granted(Capability::Events, |p| p.on_event(event));
     }
 
-    /// Run every [`Capability::MessageContent`] plugin's message transform, in
-    /// registration order, and return the final rendered content.
+    /// Run each [`Capability::MessageContent`] plugin's message transform in
+    /// order and return the final text.
     pub fn render_message(&mut self, author: &str, content: &str) -> String {
         let mut message = Message {
             author: author.to_string(),
@@ -221,14 +219,14 @@ impl Host {
         message.content
     }
 
-    /// Run every [`Capability::Composer`] plugin's draft transform over `draft`
-    /// in place, in registration order.
+    /// Run each [`Capability::Composer`] plugin's draft transform over `draft`
+    /// in place, in order.
     pub fn edit_draft(&mut self, draft: &mut Draft) {
         self.each_granted(Capability::Composer, |p| p.transform_draft(draft));
     }
 
-    /// The one chokepoint where a capability is enforced: run `f` against every
-    /// plugin that holds `cap`, in registration order, and no others.
+    /// The single place a capability is checked: run `f` on every plugin that
+    /// holds `cap`, in registration order, and no others.
     fn each_granted(&mut self, cap: Capability, mut f: impl FnMut(&mut dyn Plugin)) {
         for reg in &mut self.plugins {
             if reg.granted.contains(&cap) {
@@ -256,8 +254,8 @@ mod tests {
         }
     }
 
-    /// Uppercases message content and appends a marker to a draft; records every
-    /// event it is given. One plugin exercising all three hooks.
+    /// Uppercases message content, appends a marker to a draft, and records every
+    /// event it's given. One plugin that uses all three hooks.
     #[derive(Default)]
     struct Spy {
         events: std::rc::Rc<std::cell::RefCell<Vec<Event>>>,
@@ -288,8 +286,8 @@ mod tests {
 
     #[test]
     fn a_hook_without_its_capability_never_runs() {
-        // The plugin implements transform_message, but is granted only Events,
-        // so render_message must leave the content untouched.
+        // The plugin implements transform_message but is granted only Events, so
+        // render_message must leave the content alone.
         let mut host = Host::new();
         host.register(
             &manifest("up", &[Capability::MessageContent, Capability::Events]),
@@ -338,10 +336,9 @@ mod tests {
 
     #[test]
     fn events_payload_carries_no_message_content() {
-        // Regression guard for a capability leak: an Events-only observer must
-        // never receive message text. MessageDisplayed is metadata (author)
-        // only; content is reachable solely through the MessageContent
-        // transform path, which this plugin was not granted.
+        // Guards against a capability leak: an Events-only plugin must never get
+        // message text. MessageDisplayed carries the author only; text comes only
+        // through the MessageContent transform, which this plugin wasn't granted.
         let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let mut host = Host::new();
         host.register(
@@ -406,7 +403,7 @@ mod tests {
     #[test]
     fn granting_a_subset_of_the_request_is_allowed() {
         let mut host = Host::new();
-        // Requests two, user consents to one; the ungranted one simply stays off.
+        // Asks for two, user approves one; the one not granted just stays off.
         host.register(
             &manifest("sub", &[Capability::MessageContent, Capability::Composer]),
             &[Capability::MessageContent],

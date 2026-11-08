@@ -2,12 +2,12 @@
 //! [`maycord_host::Plugin`].
 //!
 //! A native chat client has no JavaScript engine to inject into, so maycord
-//! plugins are WebAssembly: a plugin author compiles to wasm from any language
-//! (Rust, AssemblyScript, Zig, …) and the module is run here under wasmi — an
-//! interpreter, so no JIT-writable memory is introduced into the target — with
-//! a per-call fuel budget. A trap, an out-of-fuel, or any protocol violation
-//! leaves the message untouched rather than taking the client down: a misbehaving
-//! mod must never break the app.
+//! plugins are WebAssembly instead: a plugin author compiles to wasm from any
+//! language (Rust, AssemblyScript, Zig, …), and the module runs here under
+//! wasmi. wasmi is an interpreter, so it adds no new executable memory to the
+//! target, and each call gets a fuel budget. If the guest crashes, runs out of
+//! fuel, or breaks the protocol, the message is left as-is instead of taking the
+//! client down: a misbehaving mod must never break the app.
 //!
 //! Capability enforcement is the host's job, not this crate's: [`maycord_host`]
 //! only calls a hook the plugin was granted, so a wasm plugin without
