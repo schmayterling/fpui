@@ -262,17 +262,81 @@ fn locate(image: &[u8], hint: u64, expected: &[u8], signature: Option<&Signature
     }
     match found {
         // The recovered spot must still carry the pinned bytes, so a signature
-        // that happens to land next to different code is rejected.
-        Some(at) => {
-            let offset = at as u64 + sig.site_offset;
-            if bytes_match(image, offset, expected) {
-                Located::At(offset)
-            } else {
-                Located::Missing
-            }
-        }
+        // that happens to land next to different code is rejected. `checked_add`
+        // stops a hostile `site_offset` from wrapping to a small, valid-looking
+        // offset that then feeds a memory write.
+        Some(at) => match (at as u64).checked_add(sig.site_offset) {
+            Some(offset) if bytes_match(image, offset, expected) => Located::At(offset),
+            _ => Located::Missing,
+        },
         None => Located::Missing,
     }
+}
+
+/// Count how many times `needle` occurs in `haystack`.
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut from = 0;
+    while let Some(at) = find_from(haystack, needle, from) {
+        count += 1;
+        from = at + 1;
+    }
+    count
+}
+
+/// Build the shortest byte window around a site that occurs exactly once in
+/// `image`, so the site can be relocated after drift. The window grows outward
+/// from the site a byte at a time on each side until it is unique, up to
+/// `max_radius`. This is the generator half of the signature scheme: it produces
+/// what [`locate`] later consumes. Returns `None` if the site is out of range or
+/// no unique window fits within `max_radius` (code so generic it never settles).
+///
+/// A signature from a single build is only guaranteed unique in that build; a
+/// later version can add code that collides with it. Use
+/// [`extract_signature_across`] with several builds for one that is far likelier
+/// to stay unique.
+pub fn extract_signature(
+    image: &[u8],
+    site_offset: u64,
+    site_len: usize,
+    max_radius: usize,
+) -> Option<Signature> {
+    extract_signature_across(&[image], site_offset, site_len, max_radius)
+}
+
+/// Like [`extract_signature`], but the window must occur exactly once in *every*
+/// image in `images`, with the site located in `images[0]`. Validating a
+/// signature against several builds at once is what makes it robust: a window
+/// that is already unique across past versions is much more likely to stay
+/// unique in the next one, which no single-build signature can promise. Returns
+/// `None` if no window up to `max_radius` is unique in all of them.
+pub fn extract_signature_across(
+    images: &[&[u8]],
+    site_offset: u64,
+    site_len: usize,
+    max_radius: usize,
+) -> Option<Signature> {
+    let first = *images.first()?;
+    let site = usize::try_from(site_offset).ok()?;
+    let site_end = site.checked_add(site_len)?;
+    if site_end > first.len() || site_len == 0 {
+        return None;
+    }
+    for radius in 0..=max_radius {
+        let start = site.saturating_sub(radius);
+        let end = site_end.saturating_add(radius).min(first.len());
+        let window = &first[start..end];
+        if images.iter().all(|image| occurrences(image, window) == 1) {
+            return Some(Signature {
+                bytes: window.to_vec(),
+                site_offset: (site - start) as u64,
+            });
+        }
+    }
+    None
 }
 
 fn event_label(event: &EventKind) -> String {
@@ -606,6 +670,48 @@ mod tests {
     fn locate_is_missing_when_the_hint_fails_and_there_is_no_signature() {
         let build = vec![0u8; 64];
         assert_eq!(at(locate(&build, 8, EXPECT, None)), None);
+    }
+
+    #[test]
+    fn extract_signature_round_trips_through_locate_after_drift() {
+        // A build where the 4-byte site repeats, so a bare pin is ambiguous but a
+        // wider window around it is unique.
+        let mut build = vec![0u8; 96];
+        build[10..14].copy_from_slice(EXPECT); // a decoy copy of the site bytes
+        build[40..44].copy_from_slice(EXPECT); // the real site
+        build[38..40].copy_from_slice(&[0x5a, 0x5b]); // unique lead-in before the real one
+        let sig = extract_signature(&build, 40, EXPECT.len(), 32).expect("unique window exists");
+        // The window had to widen past the bare 4 bytes to become unique.
+        assert!(sig.bytes.len() > EXPECT.len());
+
+        // Now drift the whole thing forward by 16 bytes and confirm locate, given
+        // only that signature, recovers the moved site.
+        let mut drifted = vec![0u8; 16];
+        drifted.extend_from_slice(&build);
+        assert_eq!(at(locate(&drifted, 40, EXPECT, Some(&sig))), Some(40 + 16));
+    }
+
+    #[test]
+    fn extract_signature_across_demands_uniqueness_in_every_build() {
+        // In build A the site bytes are unique; build B adds a second copy of
+        // them, so a cross-build signature must widen until unique in both.
+        let mut a = vec![0u8; 64];
+        a[28..30].copy_from_slice(&[0x5a, 0x5b]); // a unique lead-in, only here
+        a[30..34].copy_from_slice(EXPECT);
+        let mut b = a.clone();
+        b[50..54].copy_from_slice(EXPECT); // a colliding copy, with no lead-in
+
+        // Single-build extraction on A is happy with the bare bytes, which then
+        // collide in B.
+        let solo = extract_signature(&a, 30, EXPECT.len(), 16).unwrap();
+        assert_eq!(solo.bytes, EXPECT);
+        assert!(occurrences(&b, &solo.bytes) > 1);
+
+        // Cross-build extraction widens until the window is unique in both.
+        let cross = extract_signature_across(&[&a, &b], 30, EXPECT.len(), 16).unwrap();
+        assert_eq!(occurrences(&a, &cross.bytes), 1);
+        assert_eq!(occurrences(&b, &cross.bytes), 1);
+        assert!(cross.bytes.len() > EXPECT.len());
     }
 
     #[test]
