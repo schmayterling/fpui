@@ -1,0 +1,17 @@
+[package]
+name = "maycord-target"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Exact-identity target adapter: pin a GPUI build and its palette sites so the loader can verify a binary before patching it."
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
