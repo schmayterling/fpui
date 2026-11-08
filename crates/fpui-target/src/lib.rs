@@ -542,6 +542,9 @@ pub struct ListAppendSite {
     /// Which of the three words of the `Vec` header holds the buffer pointer. Rust
     /// doesn't guarantee `Vec`'s field order, so the adapter names it.
     pub ptr_word: u8,
+    /// The Vec's current length — used to recognise the right header at the
+    /// return (the two non-pointer words both equal this).
+    pub expected_len: u64,
     /// The raw bytes of the element to append (one `T`), pointer fields left as
     /// placeholders that `fixups` fill in.
     #[serde(with = "hex_bytes")]
@@ -878,6 +881,7 @@ mod tests {
             image_offset: 0x4ef76dc,
             expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
             ptr_word: 1,
+            expected_len: 15,
             element: vec![0; 32],
             fixups: vec![
                 ElementFixup::StaticBlob { offset: 0, bytes: b"fpui".to_vec() },

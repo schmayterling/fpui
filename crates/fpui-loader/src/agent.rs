@@ -202,7 +202,7 @@ mod frida_backend {
     use frida_gum::interceptor::{InvocationContext, InvocationListener, Interceptor, ProbeListener};
     use frida_gum::{Gum, NativePointer};
     use fpui_target::{
-        ArgOp, ReplaceOp, ReturnOp, StringArg, TargetAdapter, ValueLocation,
+        ArgOp, ElementFixup, ReplaceOp, ReturnOp, StringArg, TargetAdapter, ValueLocation,
     };
 
     use crate::{EncodedColor, PlannedWrite};
@@ -529,6 +529,181 @@ mod frida_backend {
         Ok(())
     }
 
+    thread_local! {
+        /// The sret pointer a `ListAppendProbe` stashes on enter, reads on leave.
+        static APPEND_SRET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A fixup resolved to the absolute word to write at `offset` into the element.
+    struct ResolvedFixup {
+        offset: u64,
+        value: u64,
+    }
+
+    /// Grows a target function's returned `Vec<T>` by one element on the way out,
+    /// so the app lays out and routes the new entry natively.
+    struct ListAppendProbe {
+        element: Vec<u8>,
+        fixups: Vec<ResolvedFixup>,
+        expected_len: u64,
+        ptr_word: usize,
+        token: String,
+    }
+
+    impl InvocationListener for ListAppendProbe {
+        fn on_enter(&mut self, context: InvocationContext) {
+            // x8 = the AArch64 indirect-result (sret) pointer: the Vec's slot.
+            APPEND_SRET.with(|s| s.set(context.cpu_context().reg(8)));
+        }
+
+        fn on_leave(&mut self, context: InvocationContext) {
+            let x8 = APPEND_SRET.with(|s| s.replace(0));
+            // AArch64 also returns the sret address in x0; try both.
+            let x0 = context.cpu_context().reg(0);
+            // SAFETY: x0/x8 are the Vec-returning function's sret address; by
+            // on_leave its `Vec` {ptr,cap,len} is finalised there. We locate the
+            // header (the `ptr_word` holds a plausible pointer; the other two
+            // words both equal `expected_len`), realloc its buffer one element
+            // larger via the system allocator (the target's own, so its own Vec
+            // drop frees it), copy our element in, apply the fixups, and publish
+            // the grown header. A header we can't recognise is left untouched.
+            unsafe { self.grow(x0, x8) }
+        }
+    }
+
+    impl ListAppendProbe {
+        unsafe fn grow(&self, x0: u64, x8: u64) {
+            let (base, ptr) = match vec_header(x0, self.ptr_word, self.expected_len)
+                .map(|p| (x0, p))
+                .or_else(|| vec_header(x8, self.ptr_word, self.expected_len).map(|p| (x8, p)))
+            {
+                Some(bp) => bp,
+                None => {
+                    eprintln!(
+                        "fpui: list-append `{}`: no matching Vec at the return; skipping",
+                        self.token
+                    );
+                    return;
+                }
+            };
+            let n = self.expected_len;
+            let elem = self.element.len() as u64;
+            let newptr = libc::realloc(ptr as *mut libc::c_void, ((n + 1) * elem) as usize) as u64;
+            if newptr == 0 {
+                eprintln!("fpui: list-append `{}`: realloc failed", self.token);
+                return;
+            }
+            // Write our element at index `n`, then fill its pointer fields.
+            let slot_elem = newptr + n * elem;
+            std::ptr::copy_nonoverlapping(self.element.as_ptr(), slot_elem as *mut u8, elem as usize);
+            for fx in &self.fixups {
+                *((slot_elem + fx.offset) as *mut u64) = fx.value;
+            }
+            // Publish the grown Vec: the pointer word gets the moved buffer; the
+            // other two (cap and len, both `n`) become `n + 1`.
+            let header = base as *mut u64;
+            *header.add(self.ptr_word) = newptr;
+            for i in 0..3 {
+                if i != self.ptr_word {
+                    *header.add(i) = n + 1;
+                }
+            }
+            eprintln!(
+                "fpui: list-append `{}`: grew Vec {n}->{} at {base:#x}",
+                self.token,
+                n + 1
+            );
+        }
+    }
+
+    /// At `base`, read a `Vec<T>` header (`ptr_word` is a plausible pointer; the
+    /// other two words both equal `expected_len`) and return the buffer pointer.
+    unsafe fn vec_header(base: u64, ptr_word: usize, expected_len: u64) -> Option<u64> {
+        if base == 0 || (base & 7) != 0 || ptr_word > 2 {
+            return None;
+        }
+        let w = [
+            *(base as *const u64),
+            *((base + 8) as *const u64),
+            *((base + 16) as *const u64),
+        ];
+        let ptr = w[ptr_word];
+        let others_match = (0..3).filter(|&i| i != ptr_word).all(|i| w[i] == expected_len);
+        (ptr > 0x1_0000 && (ptr & 7) == 0 && others_match).then_some(ptr)
+    }
+
+    /// Resolve each element fixup to the absolute word to write: a leaked static
+    /// blob's address, or a target function located by anchor. `None` if any
+    /// anchor fails — a bad element is not appended.
+    fn resolve_fixups(
+        fixups: &[ElementFixup],
+        image: &[u8],
+        image_base: u64,
+    ) -> Option<Vec<ResolvedFixup>> {
+        let mut out = Vec::with_capacity(fixups.len());
+        for fx in fixups {
+            let resolved = match fx {
+                ElementFixup::StaticBlob { offset, bytes } => {
+                    // Leaked for the process lifetime; the element points at it.
+                    let leaked: &'static [u8] = Box::leak(bytes.clone().into_boxed_slice());
+                    ResolvedFixup { offset: *offset, value: leaked.as_ptr() as u64 }
+                }
+                ElementFixup::TargetFn { offset, anchor } => {
+                    let hit = crate::anchor::resolve_anchor(image, &anchor.text).ok()?;
+                    ResolvedFixup { offset: *offset, value: image_base.wrapping_add(hit.func_offset) }
+                }
+                _ => return None,
+            };
+            out.push(resolved);
+        }
+        Some(out)
+    }
+
+    /// Append each `ListAppendSite` — checking its pinned entry bytes first — so
+    /// the target's own returned Vec grows by one element the app renders itself.
+    pub fn attach_appends(
+        adapter: &TargetAdapter,
+        image: &[u8],
+        image_base: u64,
+    ) -> io::Result<()> {
+        let gum = Gum::obtain();
+        let mut interceptor = Interceptor::obtain(&gum);
+        for site in &adapter.appends {
+            let addr = site.runtime_addr(image_base);
+            // SAFETY: read-only check of the pinned bytes at the resolved entry.
+            let actual = unsafe {
+                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
+            };
+            if actual != site.expected_bytes.as_slice() {
+                eprintln!(
+                    "fpui: skipping list-append `{}` at {addr:#x}; pinned bytes moved",
+                    site.token
+                );
+                continue;
+            }
+            let Some(fixups) = resolve_fixups(&site.fixups, image, image_base) else {
+                eprintln!(
+                    "fpui: list-append `{}`: a fixup anchor didn't resolve; skipping",
+                    site.token
+                );
+                continue;
+            };
+            let probe = Box::leak(Box::new(ListAppendProbe {
+                element: site.element.clone(),
+                fixups,
+                expected_len: site.expected_len,
+                ptr_word: site.ptr_word as usize,
+                token: site.token.clone(),
+            }));
+            let np = NativePointer(addr as *mut core::ffi::c_void);
+            interceptor
+                .attach(np, probe)
+                .map_err(|e| io::Error::other(format!("attach append at {addr:#x}: {e:?}")))?;
+        }
+        Box::leak(Box::new((gum, interceptor)));
+        Ok(())
+    }
+
     extern "C" {
         /// Flush the CPU instruction cache for `len` bytes at `start`. arm64 has
         /// split instruction/data caches, so a freshly written code byte is not
@@ -823,6 +998,15 @@ pub fn run() -> io::Result<()> {
     if !adapter.replaces.is_empty() {
         if let Err(e) = frida_backend::attach_replaces(&adapter, base) {
             eprintln!("fpui: function replace failed: {e}");
+        }
+    }
+    // List appends: grow a Vec the target returns so the app lays out + routes a
+    // new element itself (e.g. a settings category). Needs the image for any
+    // TargetFn fixup anchors.
+    #[cfg(all(target_os = "macos", feature = "frida"))]
+    if !adapter.appends.is_empty() {
+        if let Err(e) = frida_backend::attach_appends(&adapter, &image, base) {
+            eprintln!("fpui: list append failed: {e}");
         }
     }
 
