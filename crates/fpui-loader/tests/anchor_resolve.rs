@@ -47,6 +47,7 @@ fn adapter(returns: Vec<ReturnSite>) -> TargetAdapter {
         args: vec![],
         replaces: vec![],
         patches: vec![],
+        appends: vec![],
     }
 }
 

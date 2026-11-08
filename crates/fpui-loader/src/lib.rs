@@ -661,6 +661,7 @@ mod tests {
             args: vec![],
             replaces: vec![],
             patches: vec![],
+            appends: vec![],
         }
     }
 
