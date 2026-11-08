@@ -12,7 +12,12 @@
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[ctor::ctor]
 fn fpui_init() {
-    if let Err(error) = fpui_loader::agent::run() {
-        eprintln!("fpui agent: {error}");
+    // A panic must never unwind across this C constructor boundary — that aborts
+    // the host process. Contain both the returned error and any panic; a mod that
+    // can't apply must never crash the client.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(fpui_loader::agent::run)) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("fpui agent: {error}"),
+        Err(_) => eprintln!("fpui agent: panicked while applying; target left unchanged"),
     }
 }
