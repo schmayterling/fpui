@@ -25,17 +25,29 @@
 //! sockets, no clock beyond a zero reading, no environment — is denied. The
 //! guest has zero ambient authority beyond those two pipes, by construction.
 //!
+//! ## The stdin frame — hook name + payload
+//! stdin is **framed** so the JS receives both the hook name and the payload,
+//! not the payload alone: a little-endian `u32` hook length, the hook name
+//! (UTF-8), then the opaque payload bytes. A length prefix (rather than JSON)
+//! keeps the payload raw — it may be arbitrary bytes, which JSON would force
+//! through base64. `js/fpui.js` is the author-side helper: it parses the frame
+//! and dispatches to a per-hook handler, so one plugin can transform the
+//! `"message"` hook and pass the others through unchanged. stdout stays
+//! unframed: the guest writes only the rewritten payload (the host already knows
+//! which hook it called).
+//!
 //! ## Ceilings (v2)
-//! * The hook name is **not** delivered to the JS yet: a plugin sees only the
-//!   payload on stdin, so it transforms every hook the same way. Hook-aware
-//!   routing (a stdin framing or a per-hook WIT world) is the next step.
-//! * Only [`Plugin::transform`] is wired; `observe` stays the trait's no-op,
-//!   since an observer with no host imports and a discarded stdout could not do
-//!   anything anyway. Both wait on the host-import work.
 //! * A module that writes **nothing** to stdout is treated as "no change" (the
 //!   original payload stands), so a JS plugin cannot transform a payload to
 //!   genuinely empty output. This mirrors the ptr/len ABI's `0 = no change`
 //!   sentinel and keeps a silently-failing plugin from blanking content.
+//! * [`Plugin::observe`] now runs the module (fuel-bounded, trap-safe) and
+//!   discards stdout, but with no host imports yet a JS observer still cannot
+//!   *do* anything — it waits on the capability host-import work.
+//! * Each static Javy module embeds its own ~1.3 MiB QuickJS engine. Dynamic
+//!   linking (one shared provider + KB-scale per-plugin modules) is the
+//!   footprint win and the next step; this shim targets the static module's
+//!   nine-import surface.
 
 use fpui_host::Plugin;
 use wasmi::{Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder};
@@ -118,12 +130,14 @@ impl JavyPlugin {
         Ok(Self { engine, module, linker, fuel_per_call })
     }
 
-    /// Run the module once over `payload`: fresh store seeded with stdin, call
-    /// `_start`, return whatever it wrote to stdout. `None` on any trap,
-    /// out-of-fuel, nonzero exit, oversize output, or empty output — in every
-    /// case the caller keeps the original payload.
-    fn run(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
-        let mut store = Store::new(&self.engine, JavyCtx::new(payload));
+    /// Run the module once for `hook` over `payload`: fresh store seeded with the
+    /// framed stdin (`frame(hook, payload)`), call `_start`, return whatever it
+    /// wrote to stdout. `None` on any trap, out-of-fuel, nonzero exit, oversize
+    /// output, or empty output — in every case the caller keeps the original
+    /// payload. Shared by [`JavyPlugin::transform`] (which returns the output)
+    /// and [`JavyPlugin::observe`] (which discards it but still runs the module).
+    fn run(&mut self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        let mut store = Store::new(&self.engine, JavyCtx::new(&frame(hook, payload)));
         store.limiter(|ctx| &mut ctx.limits);
         // One budget covers instantiation and the whole `_start` run.
         store.set_fuel(self.fuel_per_call).ok()?;
@@ -152,11 +166,32 @@ impl JavyPlugin {
 }
 
 impl Plugin for JavyPlugin {
-    fn transform(&mut self, _hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
-        // The hook name is not delivered to the JS in v2 (see the module docs);
-        // the plugin sees only the payload.
-        self.run(payload)
+    fn transform(&mut self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        // stdin is framed with the hook name (see the module docs), so the JS can
+        // dispatch per hook; stdout is the rewritten payload.
+        self.run(hook, payload)
     }
+
+    fn observe(&mut self, hook: &str, payload: &[u8]) {
+        // Run the module for its side effects, discarding stdout. With no host
+        // imports yet nothing escapes the sandbox, but the fuel-bounded, trap-safe
+        // plumbing is in place for when a capability import lands.
+        let _ = self.run(hook, payload);
+    }
+}
+
+/// Frame the host→guest stdin: a little-endian `u32` hook length, the hook name
+/// (UTF-8), then the opaque payload. The length prefix keeps the payload raw
+/// (JSON would force arbitrary bytes through base64). The guest parses this to
+/// recover `(hook, payload)`; `js/fpui.js` does so for JavaScript plugins.
+fn frame(hook: &str, payload: &[u8]) -> Vec<u8> {
+    let hook = hook.as_bytes();
+    let mut buf = Vec::with_capacity(4 + hook.len() + payload.len());
+    // Hooks are short application-defined names, never anywhere near u32::MAX.
+    buf.extend_from_slice(&(hook.len() as u32).to_le_bytes());
+    buf.extend_from_slice(hook);
+    buf.extend_from_slice(payload);
+    buf
 }
 
 /// Read a little-endian `u32` from guest memory, or `None` if out of bounds.
@@ -376,11 +411,86 @@ mod tests {
     "#;
 
     #[test]
-    fn the_wasi_shim_echoes_stdin_to_stdout() {
+    fn the_shim_pipes_framed_stdin_to_stdout() {
         let wasm = wat::parse_str(ECHO_WAT).unwrap();
         let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        // The guest echoes stdin verbatim, so it sees — and returns — the exact
+        // frame the host seeded: `[u32 hook_len][hook]["hello echo"]`.
         let out = plugin.transform("message", b"hello echo").unwrap();
-        assert_eq!(out, b"hello echo");
+        assert_eq!(out, frame("message", b"hello echo"));
+    }
+
+    // A hand-written WASI command (no Javy needed) that proves the stdin FRAME
+    // carries the hook: it parses `[u32 hook_len][hook][payload]`, compares the
+    // hook to "message", and uppercases the payload only on a match — otherwise
+    // it echoes the payload unchanged. This is the WAT mirror of the real-Javy
+    // `js/examples/uppercase-message.js` plugin.
+    const DISPATCH_WAT: &str = r#"
+    (module
+      (import "wasi_snapshot_preview1" "fd_read"
+        (func $fd_read (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write"
+        (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 16) "message") ;; the hook this guest dispatches on
+      (func (export "_start")
+        (local $n i32) (local $hlen i32) (local $plen i32)
+        (local $pstart i32) (local $i i32) (local $match i32) (local $b i32)
+        ;; read the whole frame into [1024..] via one iovec {base:1024,len:4096}
+        (i32.store (i32.const 0) (i32.const 1024))
+        (i32.store (i32.const 4) (i32.const 4096))
+        (drop (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+        (local.set $n (i32.load (i32.const 8)))
+        ;; parse: hook_len @ [1024], hook @ [1028..], payload right after it
+        (local.set $hlen (i32.load (i32.const 1024)))
+        (local.set $pstart (i32.add (i32.const 1028) (local.get $hlen)))
+        (local.set $plen (i32.sub (local.get $n) (i32.add (i32.const 4) (local.get $hlen))))
+        ;; match = (hook_len == 7) && memcmp(hook, "message") == 0
+        (local.set $match (i32.const 0))
+        (if (i32.eq (local.get $hlen) (i32.const 7))
+          (then
+            (local.set $match (i32.const 1))
+            (local.set $i (i32.const 0))
+            (block $cmpdone
+              (loop $cmp
+                (br_if $cmpdone (i32.ge_u (local.get $i) (i32.const 7)))
+                (if (i32.ne
+                      (i32.load8_u (i32.add (i32.const 1028) (local.get $i)))
+                      (i32.load8_u (i32.add (i32.const 16) (local.get $i))))
+                  (then (local.set $match (i32.const 0)) (br $cmpdone)))
+                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                (br $cmp)))))
+        ;; build the output at [8192..]: uppercase iff match, else copy verbatim
+        (local.set $i (i32.const 0))
+        (block $done
+          (loop $loop
+            (br_if $done (i32.ge_u (local.get $i) (local.get $plen)))
+            (local.set $b (i32.load8_u (i32.add (local.get $pstart) (local.get $i))))
+            (if (i32.and (local.get $match)
+                  (i32.and (i32.ge_u (local.get $b) (i32.const 97))
+                           (i32.le_u (local.get $b) (i32.const 122))))
+              (then (local.set $b (i32.sub (local.get $b) (i32.const 32)))))
+            (i32.store8 (i32.add (i32.const 8192) (local.get $i)) (local.get $b))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $loop)))
+        ;; write the transformed payload from [8192..]
+        (i32.store (i32.const 0) (i32.const 8192))
+        (i32.store (i32.const 4) (local.get $plen))
+        (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+        (call $proc_exit (i32.const 0))))
+    "#;
+
+    #[test]
+    fn the_frame_delivers_the_hook_so_the_guest_can_dispatch() {
+        let wasm = wat::parse_str(DISPATCH_WAT).unwrap();
+        let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        // Hook "message" → payload uppercased.
+        assert_eq!(plugin.transform("message", b"hello").unwrap(), b"HELLO");
+        // Any other hook → payload passed through unchanged. The hook crossed the
+        // boundary and the guest branched on it; without the frame both would
+        // transform identically.
+        assert_eq!(plugin.transform("reaction", b"hello").unwrap(), b"hello");
     }
 
     // Exits non-zero without writing: the transform must be discarded.
@@ -427,20 +537,50 @@ mod tests {
         assert!(plugin.transform("message", b"intact").is_none());
     }
 
+    // `run` is the shared execution path: instantiate, seed the framed stdin, run
+    // `_start`, collect stdout. Proving it here pins down that `observe` (a thin
+    // `let _ = self.run(..)`) really executes the module, not just that it is safe.
+    #[test]
+    fn run_executes_the_module_and_collects_stdout() {
+        let wasm = wat::parse_str(DISPATCH_WAT).unwrap();
+        let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        assert_eq!(plugin.run("message", b"hi").unwrap(), b"HI");
+    }
+
+    // Observe runs the module like transform (same fuel/trap guarantees) but
+    // reads no output. A module that exits non-zero would discard a transform;
+    // observe must swallow it and return.
+    #[test]
+    fn observe_runs_the_module_and_swallows_failure() {
+        let wasm = wat::parse_str(FAIL_WAT).unwrap();
+        let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        plugin.observe("ready", b"anything"); // must not panic
+    }
+
+    // A runaway observer is fuel-trapped just like a transform, so a bad JS
+    // observer can't hang the host.
+    #[test]
+    fn observe_is_fuel_bounded() {
+        let wasm = wat::parse_str(SPIN_WAT).unwrap();
+        let mut plugin = JavyPlugin::load_with_fuel(&wasm, 1_000_000).unwrap();
+        plugin.observe("ready", b"x"); // runaway trapped, observe returns
+    }
+
     // A JavyPlugin is just a Plugin: it drops into the capability-gated host and
-    // runs through a granted hook like any other.
+    // dispatches on the granted hook like any other. The hook reaches the guest
+    // through the host, which uppercases only "message".
     #[test]
     fn runs_through_the_capability_gated_host() {
         use fpui_host::Host;
         use fpui_manifest::{Capability, ExtensionKind, Manifest, API_VERSION};
 
-        let wasm = wat::parse_str(ECHO_WAT).unwrap();
+        let wasm = wat::parse_str(DISPATCH_WAT).unwrap();
         let plugin = JavyPlugin::load(&wasm).unwrap();
         let cap = Capability::new("content");
         let manifest = Manifest {
             api_version: API_VERSION,
-            id: "js-echo".into(),
-            name: "JsEcho".into(),
+            id: "js-dispatch".into(),
+            name: "JsDispatch".into(),
             version: "1.0.0".into(),
             author: "fpui".into(),
             license: "GPL-3.0-or-later".into(),
@@ -451,6 +591,6 @@ mod tests {
         let mut host = Host::new();
         host.register(&manifest, std::slice::from_ref(&cap), Box::new(plugin)).unwrap();
         let out = host.transform(&cap, "message", b"through the host");
-        assert_eq!(out, b"through the host");
+        assert_eq!(out, b"THROUGH THE HOST");
     }
 }
