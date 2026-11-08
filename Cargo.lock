@@ -768,6 +768,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "maycord-monitor"
+version = "0.1.0"
+dependencies = [
+ "maycord-loader",
+ "maycord-target",
+ "serde_json",
+]
+
+[[package]]
 name = "maycord-plugin-sdk"
 version = "0.1.0"
 
