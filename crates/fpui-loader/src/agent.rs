@@ -24,6 +24,69 @@ fn invalid(e: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The loaded target image's mapped address range, recorded once in [`run`]
+/// before any live byte check. Every `expected_bytes` read is bounded against
+/// this first, so a malicious or corrupt adapter offset can't walk the read off
+/// the image into unmapped memory (or a neighbouring mapping) before the compare.
+static IMAGE_LO: AtomicU64 = AtomicU64::new(0);
+static IMAGE_HI: AtomicU64 = AtomicU64::new(0);
+
+/// Record the image's mapped bounds from its verified load base and its own
+/// segment extent. If the extent can't be parsed, fall back to the on-disk file
+/// length — still an upper bound on every file-backed site, so the guard holds.
+fn set_image_bounds(base: u64, image: &[u8]) {
+    let extent = image_vm_extent(image).unwrap_or(image.len() as u64);
+    IMAGE_LO.store(base, Ordering::Relaxed);
+    IMAGE_HI.store(base.saturating_add(extent), Ordering::Relaxed);
+}
+
+/// The image's virtual-address span: the highest segment end minus the `__TEXT`
+/// vmaddr (the load base). `__PAGEZERO` is excluded so its multi-GB guard region
+/// doesn't inflate the bound.
+fn image_vm_extent(image: &[u8]) -> Option<u64> {
+    use object::{Object, ObjectSegment};
+    let file = object::File::parse(image).ok()?;
+    let text = file
+        .segments()
+        .find(|s| matches!(s.name(), Ok(Some("__TEXT"))))?
+        .address();
+    let hi = file
+        .segments()
+        .filter(|s| !matches!(s.name(), Ok(Some("__PAGEZERO"))))
+        .map(|s| s.address().saturating_add(s.size()))
+        .max()?;
+    hi.checked_sub(text)
+}
+
+/// True iff `[addr, addr + len)` lies inside the recorded image bounds. Fail
+/// open only when the bounds are unset (`hi == 0`): that state happens solely
+/// outside the inject flow — unit tests pointing at their own buffers — and
+/// [`run`] records the bounds before any attach, so the guard is live where it
+/// matters.
+fn in_image(addr: u64, len: usize) -> bool {
+    in_bounds(
+        addr,
+        len,
+        IMAGE_LO.load(Ordering::Relaxed),
+        IMAGE_HI.load(Ordering::Relaxed),
+    )
+}
+
+/// The pure bound check behind [`in_image`], split out so its edge cases (exact
+/// fit, length overflow, unset bounds) are unit-testable without the
+/// process-global statics. Fails open only when `hi == 0` (bounds unset).
+fn in_bounds(addr: u64, len: usize, lo: u64, hi: u64) -> bool {
+    if hi == 0 {
+        return true;
+    }
+    match addr.checked_add(len as u64) {
+        Some(end) => addr >= lo && end <= hi,
+        None => false,
+    }
+}
+
 /// One plugin to host: where its wasm module is on disk, its manifest, and the
 /// capabilities the user granted it.
 #[derive(Deserialize)]
@@ -135,6 +198,12 @@ pub fn verify_sites(plan: &[PlannedWrite]) -> Result<(), SiteMismatch> {
         // `expected_bytes.len()` bytes to compare and never write. A wrong
         // address is what this check is meant to catch, and we only get here
         // after the loader's whole-file identity check passed.
+        if !in_image(write.runtime_addr, write.expected_bytes.len()) {
+            return Err(SiteMismatch {
+                token: write.token.clone(),
+                addr: write.runtime_addr,
+            });
+        }
         let actual = unsafe {
             std::slice::from_raw_parts(write.runtime_addr as *const u8, write.expected_bytes.len())
         };
@@ -158,6 +227,13 @@ pub fn partition_live(plan: &[PlannedWrite]) -> (Vec<PlannedWrite>, Vec<SiteMism
     for write in plan {
         // SAFETY: identical to `verify_sites` — a read-only compare of exactly
         // `expected_bytes.len()` bytes at an identity-checked image offset.
+        if !in_image(write.runtime_addr, write.expected_bytes.len()) {
+            stale.push(SiteMismatch {
+                token: write.token.clone(),
+                addr: write.runtime_addr,
+            });
+            continue;
+        }
         let actual = unsafe {
             std::slice::from_raw_parts(write.runtime_addr as *const u8, write.expected_bytes.len())
         };
@@ -336,6 +412,10 @@ mod frida_backend {
         let mut interceptor = Interceptor::obtain(&gum);
         for site in &adapter.events {
             let addr = site.runtime_addr(image_base);
+            if !super::in_image(addr, site.expected_bytes.len()) {
+                eprintln!("fpui: skipping site at {addr:#x}; offset escapes the image");
+                continue;
+            }
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
             let actual =
                 unsafe { std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len()) };
@@ -387,6 +467,10 @@ mod frida_backend {
         let mut interceptor = Interceptor::obtain(&gum);
         for site in &adapter.returns {
             let addr = site.runtime_addr(image_base);
+            if !super::in_image(addr, site.expected_bytes.len()) {
+                eprintln!("fpui: skipping site at {addr:#x}; offset escapes the image");
+                continue;
+            }
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
             let actual = unsafe {
                 std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
@@ -433,6 +517,10 @@ mod frida_backend {
         let mut interceptor = Interceptor::obtain(&gum);
         for site in &adapter.args {
             let addr = site.runtime_addr(image_base);
+            if !super::in_image(addr, site.expected_bytes.len()) {
+                eprintln!("fpui: skipping site at {addr:#x}; offset escapes the image");
+                continue;
+            }
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
             let actual = unsafe {
                 std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
@@ -490,6 +578,10 @@ mod frida_backend {
         let mut interceptor = Interceptor::obtain(&gum);
         for site in &adapter.replaces {
             let addr = site.runtime_addr(image_base);
+            if !super::in_image(addr, site.expected_bytes.len()) {
+                eprintln!("fpui: skipping site at {addr:#x}; offset escapes the image");
+                continue;
+            }
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
             let actual = unsafe {
                 std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
@@ -670,6 +762,10 @@ mod frida_backend {
         let mut interceptor = Interceptor::obtain(&gum);
         for site in &adapter.appends {
             let addr = site.runtime_addr(image_base);
+            if !super::in_image(addr, site.expected_bytes.len()) {
+                eprintln!("fpui: skipping site at {addr:#x}; offset escapes the image");
+                continue;
+            }
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
             let actual = unsafe {
                 std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
@@ -820,6 +916,10 @@ mod frida_backend {
             }
             let addr = patch.runtime_addr(image_base);
             let len = patch.expected_bytes.len();
+            if !super::in_image(addr, len) {
+                eprintln!("fpui: skipping byte patch `{}`; offset escapes the image", patch.token);
+                continue;
+            }
             // SAFETY: a read-only compare of exactly `len` bytes at a verified
             // image offset — the gate that refuses to write on a wrong build.
             let live = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
@@ -940,6 +1040,9 @@ pub fn run() -> io::Result<()> {
              re-resolution and the per-site byte check"
         );
     }
+    // Record the image's mapped bounds so every live byte check rejects an
+    // out-of-image address before dereferencing it.
+    set_image_bounds(base, &image);
     let adapter = {
         let (resolved, dropped) = resolve_adapter(&adapter, &image);
         for label in &dropped {
@@ -1073,6 +1176,23 @@ mod tests {
         assert_eq!(live.len(), 1);
         assert_eq!(stale.len(), 1);
         assert_eq!(stale[0].token, "sidebar");
+    }
+
+    #[test]
+    fn in_bounds_rejects_reads_outside_the_image() {
+        let (lo, hi) = (0x1000, 0x2000);
+        // Fully inside, and an exact fit right up to the top edge: allowed.
+        assert!(in_bounds(0x1000, 16, lo, hi));
+        assert!(in_bounds(0x1ff0, 0x10, lo, hi));
+        // Before the base, starting at the end, or straddling the top: rejected.
+        assert!(!in_bounds(0x0fff, 1, lo, hi));
+        assert!(!in_bounds(0x2000, 1, lo, hi));
+        assert!(!in_bounds(0x1ff0, 0x11, lo, hi));
+        // A length that overflows the address is never in range.
+        assert!(!in_bounds(u64::MAX - 4, 64, lo, hi));
+        // Bounds unset (hi == 0): fail open, so unit tests and any non-inject
+        // caller read as before; `run` records real bounds before any attach.
+        assert!(in_bounds(0xdead_beef, 32, 0, 0));
     }
 
     #[test]
