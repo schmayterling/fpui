@@ -17,25 +17,51 @@
 //! own [`Store`] — its own linear memory, fuel, and stdin/stdout — so plugins
 //! and successive calls never share state.
 //!
+//! ## Static vs dynamic linking
+//! [`JavyPlugin`] runs a **static** module: the QuickJS engine (~1.3 MiB) is
+//! embedded in every plugin. [`JavyRuntime`] runs **dynamic** modules instead:
+//! the engine is compiled *once* as a shared plugin module (`javy emit-plugin`)
+//! and each JS plugin is a tiny 1-16 KiB module (`javy build -C dynamic`) that
+//! imports the shared engine's `memory`, `cabi_realloc`, and `invoke`. N plugins
+//! then cost ~1.3 MiB + N×(KBs) of wasm instead of N×1.3 MiB. Isolation is
+//! unchanged — a *fresh* engine instance is built per call, sharing only the
+//! compiled module, so no QuickJS state leaks between calls or plugins.
+//!
 //! ## The shim — two pipes and nothing else
-//! Javy imports nine `wasi_snapshot_preview1` functions. This module provides
-//! all nine, backed only by two in-memory buffers: stdin (fd 0, read-only, the
-//! payload) and stdout (fd 1, write-only, the result). fd 2 (stderr) is
-//! discarded; every other descriptor and every other capability — no files, no
-//! sockets, no clock beyond a zero reading, no environment — is denied. The
-//! guest has zero ambient authority beyond those two pipes, by construction.
+//! A Javy module imports a handful of `wasi_snapshot_preview1` functions (nine
+//! for a static module; a dynamic plugin also wants `random_get`). This module
+//! provides all ten, backed only by two in-memory buffers: stdin (fd 0,
+//! read-only, the payload) and stdout (fd 1, write-only, the result). fd 2
+//! (stderr) is discarded; `random_get` is zero-filled; every other descriptor
+//! and every other capability — no files, no sockets, no clock beyond a zero
+//! reading, no environment, no real entropy — is denied. The guest has zero
+//! ambient authority beyond those two pipes, by construction.
+//!
+//! ## The stdin frame — hook name + payload
+//! stdin is **framed** so the JS receives both the hook name and the payload,
+//! not the payload alone: a little-endian `u32` hook length, the hook name
+//! (UTF-8), then the opaque payload bytes. A length prefix (rather than JSON)
+//! keeps the payload raw — it may be arbitrary bytes, which JSON would force
+//! through base64. `js/fpui.js` is the author-side helper: it parses the frame
+//! and dispatches to a per-hook handler, so one plugin can transform the
+//! `"message"` hook and pass the others through unchanged. stdout stays
+//! unframed: the guest writes only the rewritten payload (the host already knows
+//! which hook it called).
 //!
 //! ## Ceilings (v2)
-//! * The hook name is **not** delivered to the JS yet: a plugin sees only the
-//!   payload on stdin, so it transforms every hook the same way. Hook-aware
-//!   routing (a stdin framing or a per-hook WIT world) is the next step.
-//! * Only [`Plugin::transform`] is wired; `observe` stays the trait's no-op,
-//!   since an observer with no host imports and a discarded stdout could not do
-//!   anything anyway. Both wait on the host-import work.
 //! * A module that writes **nothing** to stdout is treated as "no change" (the
 //!   original payload stands), so a JS plugin cannot transform a payload to
 //!   genuinely empty output. This mirrors the ptr/len ABI's `0 = no change`
 //!   sentinel and keeps a silently-failing plugin from blanking content.
+//! * [`Plugin::observe`] now runs the module (fuel-bounded, trap-safe) and
+//!   discards stdout, but with no host imports yet a JS observer still cannot
+//!   *do* anything — it waits on the capability host-import work.
+//! * No capability host-imports yet: a JS plugin has zero ambient authority, so
+//!   `observe` runs but cannot act, and a transform is a pure function of its
+//!   framed input. Wiring the first host import (e.g. storage) into JS globals
+//!   through the import chokepoint is the next step.
+
+use std::sync::Arc;
 
 use fpui_host::Plugin;
 use wasmi::{Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder};
@@ -118,12 +144,14 @@ impl JavyPlugin {
         Ok(Self { engine, module, linker, fuel_per_call })
     }
 
-    /// Run the module once over `payload`: fresh store seeded with stdin, call
-    /// `_start`, return whatever it wrote to stdout. `None` on any trap,
-    /// out-of-fuel, nonzero exit, oversize output, or empty output — in every
-    /// case the caller keeps the original payload.
-    fn run(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
-        let mut store = Store::new(&self.engine, JavyCtx::new(payload));
+    /// Run the module once for `hook` over `payload`: fresh store seeded with the
+    /// framed stdin (`frame(hook, payload)`), call `_start`, return whatever it
+    /// wrote to stdout. `None` on any trap, out-of-fuel, nonzero exit, oversize
+    /// output, or empty output — in every case the caller keeps the original
+    /// payload. Shared by [`JavyPlugin::transform`] (which returns the output)
+    /// and [`JavyPlugin::observe`] (which discards it but still runs the module).
+    fn run(&mut self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        let mut store = Store::new(&self.engine, JavyCtx::new(&frame(hook, payload)));
         store.limiter(|ctx| &mut ctx.limits);
         // One budget covers instantiation and the whole `_start` run.
         store.set_fuel(self.fuel_per_call).ok()?;
@@ -152,11 +180,157 @@ impl JavyPlugin {
 }
 
 impl Plugin for JavyPlugin {
-    fn transform(&mut self, _hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
-        // The hook name is not delivered to the JS in v2 (see the module docs);
-        // the plugin sees only the payload.
-        self.run(payload)
+    fn transform(&mut self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        // stdin is framed with the hook name (see the module docs), so the JS can
+        // dispatch per hook; stdout is the rewritten payload.
+        self.run(hook, payload)
     }
+
+    fn observe(&mut self, hook: &str, payload: &[u8]) {
+        // Run the module for its side effects, discarding stdout. With no host
+        // imports yet nothing escapes the sandbox, but the fuel-bounded, trap-safe
+        // plumbing is in place for when a capability import lands.
+        let _ = self.run(hook, payload);
+    }
+}
+
+/// The shared QuickJS engine for dynamically-linked plugins: the ~1.3 MiB Javy
+/// plugin module (`javy emit-plugin`), compiled once and reused to run many tiny
+/// dynamic plugin modules. A dynamic module is 1-16 KiB and imports this engine's
+/// `memory`, `cabi_realloc`, and `invoke`, so the engine is stored once instead
+/// of embedded in every plugin: N JS plugins cost ~1.3 MiB + N×(KBs) of wasm
+/// rather than N×1.3 MiB.
+///
+/// Isolation is preserved. Only the *compiled* engine module is shared; a fresh
+/// instance is built per call, so no QuickJS state leaks between calls or between
+/// plugins. The win is module footprint, never a shared live instance.
+struct SharedEngine {
+    engine: Engine,
+    /// The shared QuickJS plugin module.
+    plugin: Module,
+    /// The WASI shim, reusable across every call's [`Store`].
+    wasi: Linker<JavyCtx>,
+}
+
+/// A runtime hosting one shared QuickJS engine for dynamically-linked plugins.
+/// Load the engine once, then [`JavyRuntime::load`] any number of tiny modules.
+pub struct JavyRuntime {
+    shared: Arc<SharedEngine>,
+    fuel_per_call: u64,
+}
+
+impl JavyRuntime {
+    /// Build a runtime around the shared plugin module emitted by
+    /// `javy emit-plugin`, with the [`JAVY_DEFAULT_FUEL`] per-call budget.
+    pub fn new(plugin_wasm: &[u8]) -> Result<Self, WasmError> {
+        Self::new_with_fuel(plugin_wasm, JAVY_DEFAULT_FUEL)
+    }
+
+    /// Build a runtime with an explicit per-call fuel budget.
+    pub fn new_with_fuel(plugin_wasm: &[u8], fuel_per_call: u64) -> Result<Self, WasmError> {
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        config.wasm_simd(true).wasm_relaxed_simd(true);
+        let engine = Engine::new(&config);
+        let plugin = Module::new(&engine, plugin_wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
+        let mut wasi = Linker::new(&engine);
+        define_wasi(&mut wasi).map_err(|e| WasmError::Instantiate(e.to_string()))?;
+        Ok(Self { shared: Arc::new(SharedEngine { engine, plugin, wasi }), fuel_per_call })
+    }
+
+    /// Compile a dynamically-linked plugin module (`javy build -C dynamic`)
+    /// against this runtime's shared engine.
+    pub fn load(&self, module_wasm: &[u8]) -> Result<DynamicJavyPlugin, WasmError> {
+        let module = Module::new(&self.shared.engine, module_wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
+        // The module's imports all name the shared plugin; capture that namespace
+        // from the module itself so the exact string (e.g. the versioned
+        // "javy-default-plugin-v4") is never hard-coded here.
+        let plugin_ns = module
+            .imports()
+            .next()
+            .ok_or(WasmError::MissingExport("plugin import"))?
+            .module()
+            .to_string();
+        Ok(DynamicJavyPlugin { shared: Arc::clone(&self.shared), module, plugin_ns, fuel_per_call: self.fuel_per_call })
+    }
+}
+
+/// One dynamically-linked JS plugin: a tiny module that runs on a shared
+/// [`JavyRuntime`] engine. A [`Plugin`] exactly like [`JavyPlugin`], but without
+/// the embedded engine.
+pub struct DynamicJavyPlugin {
+    shared: Arc<SharedEngine>,
+    module: Module,
+    /// The import namespace the dynamic module expects the shared engine under.
+    plugin_ns: String,
+    fuel_per_call: u64,
+}
+
+impl DynamicJavyPlugin {
+    /// Run the tiny module once for `hook` over `payload`: a fresh engine
+    /// instance is initialized, the module is linked to it, and its `_start`
+    /// runs. Same `None`-keeps-the-original contract as [`JavyPlugin::run`].
+    fn run(&self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        let mut store = Store::new(&self.shared.engine, JavyCtx::new(&frame(hook, payload)));
+        store.limiter(|ctx| &mut ctx.limits);
+        // One budget covers engine init, linking, and the `_start` run.
+        store.set_fuel(self.fuel_per_call).ok()?;
+
+        // A fresh engine instance for this call, so no QuickJS state carries over.
+        // The shared plugin from `javy emit-plugin` is already pre-initialized, so
+        // the host does NOT call `initialize-runtime` — that is the plugin's
+        // Wizer pre-init entry, and invoking it on an initialized runtime panics.
+        let plugin = self.shared.wasi.instantiate_and_start(&mut store, &self.shared.plugin).ok()?;
+
+        // Wire the tiny module's three imports to this engine instance's exports.
+        let memory = plugin.get_memory(&store, "memory")?;
+        let cabi_realloc = plugin.get_func(&store, "cabi_realloc")?;
+        let invoke = plugin.get_func(&store, "invoke")?;
+        let mut linker = Linker::new(&self.shared.engine);
+        linker.define(&self.plugin_ns, "memory", memory).ok()?;
+        linker.define(&self.plugin_ns, "cabi_realloc", cabi_realloc).ok()?;
+        linker.define(&self.plugin_ns, "invoke", invoke).ok()?;
+
+        let instance = linker.instantiate_and_start(&mut store, &self.module).ok()?;
+        let start = instance.get_typed_func::<(), ()>(&store, "_start").ok()?;
+        match start.call(&mut store, ()) {
+            Ok(()) => {}
+            Err(e) => match e.i32_exit_status() {
+                Some(0) => {}
+                _ => return None,
+            },
+        }
+
+        let ctx = store.data_mut();
+        if ctx.output_overflow || ctx.stdout.len() > MAX_OUTPUT || ctx.stdout.is_empty() {
+            return None;
+        }
+        Some(core::mem::take(&mut ctx.stdout))
+    }
+}
+
+impl Plugin for DynamicJavyPlugin {
+    fn transform(&mut self, hook: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        self.run(hook, payload)
+    }
+
+    fn observe(&mut self, hook: &str, payload: &[u8]) {
+        let _ = self.run(hook, payload);
+    }
+}
+
+/// Frame the host→guest stdin: a little-endian `u32` hook length, the hook name
+/// (UTF-8), then the opaque payload. The length prefix keeps the payload raw
+/// (JSON would force arbitrary bytes through base64). The guest parses this to
+/// recover `(hook, payload)`; `js/fpui.js` does so for JavaScript plugins.
+fn frame(hook: &str, payload: &[u8]) -> Vec<u8> {
+    let hook = hook.as_bytes();
+    let mut buf = Vec::with_capacity(4 + hook.len() + payload.len());
+    // Hooks are short application-defined names, never anywhere near u32::MAX.
+    buf.extend_from_slice(&(hook.len() as u32).to_le_bytes());
+    buf.extend_from_slice(hook);
+    buf.extend_from_slice(payload);
+    buf
 }
 
 /// Read a little-endian `u32` from guest memory, or `None` if out of bounds.
@@ -184,7 +358,7 @@ fn guest_memory(caller: &Caller<JavyCtx>) -> Option<Memory> {
     caller.get_export("memory").and_then(Extern::into_memory)
 }
 
-/// Define the nine `wasi_snapshot_preview1` imports a Javy module needs, backed
+/// Define the ten `wasi_snapshot_preview1` imports a Javy module needs, backed
 /// only by the in-memory stdin/stdout pipes. Everything outside those two pipes
 /// is denied, so the guest has no ambient authority to reach a real resource.
 fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
@@ -343,6 +517,27 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
         },
     )?;
 
+    // random_get(buf, len): a dynamic plugin seeds its RNG here. There is no
+    // ambient entropy to give — zero-fill the buffer. Deterministic and
+    // authority-free, matching the zero clock; it only makes `Math.random()`
+    // non-secure, which is harmless in a transform sandbox that holds no secrets.
+    linker.func_wrap(
+        WASI,
+        "random_get",
+        |mut caller: Caller<JavyCtx>, buf: i32, len: i32| -> Result<i32, Error> {
+            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let (data, _ctx) = mem.data_and_store_mut(&mut caller);
+            let (start, end) = (buf as usize, (buf as usize).saturating_add(len as usize));
+            match data.get_mut(start..end) {
+                Some(slot) => {
+                    slot.fill(0);
+                    Ok(ERRNO_SUCCESS)
+                }
+                None => Ok(ERRNO_BADF),
+            }
+        },
+    )?;
+
     Ok(())
 }
 
@@ -376,11 +571,86 @@ mod tests {
     "#;
 
     #[test]
-    fn the_wasi_shim_echoes_stdin_to_stdout() {
+    fn the_shim_pipes_framed_stdin_to_stdout() {
         let wasm = wat::parse_str(ECHO_WAT).unwrap();
         let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        // The guest echoes stdin verbatim, so it sees — and returns — the exact
+        // frame the host seeded: `[u32 hook_len][hook]["hello echo"]`.
         let out = plugin.transform("message", b"hello echo").unwrap();
-        assert_eq!(out, b"hello echo");
+        assert_eq!(out, frame("message", b"hello echo"));
+    }
+
+    // A hand-written WASI command (no Javy needed) that proves the stdin FRAME
+    // carries the hook: it parses `[u32 hook_len][hook][payload]`, compares the
+    // hook to "message", and uppercases the payload only on a match — otherwise
+    // it echoes the payload unchanged. This is the WAT mirror of the real-Javy
+    // `js/examples/uppercase-message.js` plugin.
+    const DISPATCH_WAT: &str = r#"
+    (module
+      (import "wasi_snapshot_preview1" "fd_read"
+        (func $fd_read (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write"
+        (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 16) "message") ;; the hook this guest dispatches on
+      (func (export "_start")
+        (local $n i32) (local $hlen i32) (local $plen i32)
+        (local $pstart i32) (local $i i32) (local $match i32) (local $b i32)
+        ;; read the whole frame into [1024..] via one iovec {base:1024,len:4096}
+        (i32.store (i32.const 0) (i32.const 1024))
+        (i32.store (i32.const 4) (i32.const 4096))
+        (drop (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+        (local.set $n (i32.load (i32.const 8)))
+        ;; parse: hook_len @ [1024], hook @ [1028..], payload right after it
+        (local.set $hlen (i32.load (i32.const 1024)))
+        (local.set $pstart (i32.add (i32.const 1028) (local.get $hlen)))
+        (local.set $plen (i32.sub (local.get $n) (i32.add (i32.const 4) (local.get $hlen))))
+        ;; match = (hook_len == 7) && memcmp(hook, "message") == 0
+        (local.set $match (i32.const 0))
+        (if (i32.eq (local.get $hlen) (i32.const 7))
+          (then
+            (local.set $match (i32.const 1))
+            (local.set $i (i32.const 0))
+            (block $cmpdone
+              (loop $cmp
+                (br_if $cmpdone (i32.ge_u (local.get $i) (i32.const 7)))
+                (if (i32.ne
+                      (i32.load8_u (i32.add (i32.const 1028) (local.get $i)))
+                      (i32.load8_u (i32.add (i32.const 16) (local.get $i))))
+                  (then (local.set $match (i32.const 0)) (br $cmpdone)))
+                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                (br $cmp)))))
+        ;; build the output at [8192..]: uppercase iff match, else copy verbatim
+        (local.set $i (i32.const 0))
+        (block $done
+          (loop $loop
+            (br_if $done (i32.ge_u (local.get $i) (local.get $plen)))
+            (local.set $b (i32.load8_u (i32.add (local.get $pstart) (local.get $i))))
+            (if (i32.and (local.get $match)
+                  (i32.and (i32.ge_u (local.get $b) (i32.const 97))
+                           (i32.le_u (local.get $b) (i32.const 122))))
+              (then (local.set $b (i32.sub (local.get $b) (i32.const 32)))))
+            (i32.store8 (i32.add (i32.const 8192) (local.get $i)) (local.get $b))
+            (local.set $i (i32.add (local.get $i) (i32.const 1)))
+            (br $loop)))
+        ;; write the transformed payload from [8192..]
+        (i32.store (i32.const 0) (i32.const 8192))
+        (i32.store (i32.const 4) (local.get $plen))
+        (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 8)))
+        (call $proc_exit (i32.const 0))))
+    "#;
+
+    #[test]
+    fn the_frame_delivers_the_hook_so_the_guest_can_dispatch() {
+        let wasm = wat::parse_str(DISPATCH_WAT).unwrap();
+        let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        // Hook "message" → payload uppercased.
+        assert_eq!(plugin.transform("message", b"hello").unwrap(), b"HELLO");
+        // Any other hook → payload passed through unchanged. The hook crossed the
+        // boundary and the guest branched on it; without the frame both would
+        // transform identically.
+        assert_eq!(plugin.transform("reaction", b"hello").unwrap(), b"hello");
     }
 
     // Exits non-zero without writing: the transform must be discarded.
@@ -427,20 +697,50 @@ mod tests {
         assert!(plugin.transform("message", b"intact").is_none());
     }
 
+    // `run` is the shared execution path: instantiate, seed the framed stdin, run
+    // `_start`, collect stdout. Proving it here pins down that `observe` (a thin
+    // `let _ = self.run(..)`) really executes the module, not just that it is safe.
+    #[test]
+    fn run_executes_the_module_and_collects_stdout() {
+        let wasm = wat::parse_str(DISPATCH_WAT).unwrap();
+        let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        assert_eq!(plugin.run("message", b"hi").unwrap(), b"HI");
+    }
+
+    // Observe runs the module like transform (same fuel/trap guarantees) but
+    // reads no output. A module that exits non-zero would discard a transform;
+    // observe must swallow it and return.
+    #[test]
+    fn observe_runs_the_module_and_swallows_failure() {
+        let wasm = wat::parse_str(FAIL_WAT).unwrap();
+        let mut plugin = JavyPlugin::load(&wasm).unwrap();
+        plugin.observe("ready", b"anything"); // must not panic
+    }
+
+    // A runaway observer is fuel-trapped just like a transform, so a bad JS
+    // observer can't hang the host.
+    #[test]
+    fn observe_is_fuel_bounded() {
+        let wasm = wat::parse_str(SPIN_WAT).unwrap();
+        let mut plugin = JavyPlugin::load_with_fuel(&wasm, 1_000_000).unwrap();
+        plugin.observe("ready", b"x"); // runaway trapped, observe returns
+    }
+
     // A JavyPlugin is just a Plugin: it drops into the capability-gated host and
-    // runs through a granted hook like any other.
+    // dispatches on the granted hook like any other. The hook reaches the guest
+    // through the host, which uppercases only "message".
     #[test]
     fn runs_through_the_capability_gated_host() {
         use fpui_host::Host;
         use fpui_manifest::{Capability, ExtensionKind, Manifest, API_VERSION};
 
-        let wasm = wat::parse_str(ECHO_WAT).unwrap();
+        let wasm = wat::parse_str(DISPATCH_WAT).unwrap();
         let plugin = JavyPlugin::load(&wasm).unwrap();
         let cap = Capability::new("content");
         let manifest = Manifest {
             api_version: API_VERSION,
-            id: "js-echo".into(),
-            name: "JsEcho".into(),
+            id: "js-dispatch".into(),
+            name: "JsDispatch".into(),
             version: "1.0.0".into(),
             author: "fpui".into(),
             license: "GPL-3.0-or-later".into(),
@@ -451,6 +751,80 @@ mod tests {
         let mut host = Host::new();
         host.register(&manifest, std::slice::from_ref(&cap), Box::new(plugin)).unwrap();
         let out = host.transform(&cap, "message", b"through the host");
-        assert_eq!(out, b"through the host");
+        assert_eq!(out, b"THROUGH THE HOST");
+    }
+
+    // A javy-free stand-in for the shared QuickJS plugin: it exports `memory`,
+    // `cabi_realloc`, and `invoke` — the exact surface a real `javy emit-plugin`
+    // module exposes to a dynamic module — and imports only the shim's stdio.
+    // `invoke` echoes the framed stdin to stdout on this (shared) memory, standing
+    // in for "run the embedded JS".
+    const FAKE_PLUGIN_WAT: &str = r#"
+    (module
+      (import "wasi_snapshot_preview1" "fd_read"
+        (func $fd_read (param i32 i32 i32 i32) (result i32)))
+      (import "wasi_snapshot_preview1" "fd_write"
+        (func $fd_write (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (global $heap (mut i32) (i32.const 2048))
+      (func (export "cabi_realloc")
+        (param $ptr i32) (param $old i32) (param $align i32) (param $new i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $heap))
+        (global.set $heap (i32.add (global.get $heap) (local.get $new)))
+        (local.get $p))
+      ;; invoke(a,b,c,d,e): read stdin into [64..], write it back to stdout.
+      (func (export "invoke") (param i32 i32 i32 i32 i32)
+        (local $n i32)
+        (i32.store (i32.const 0) (i32.const 64))
+        (i32.store (i32.const 4) (i32.const 4096))
+        (drop (call $fd_read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 8)))
+        (local.set $n (i32.load (i32.const 8)))
+        (i32.store (i32.const 16) (i32.const 64))
+        (i32.store (i32.const 20) (local.get $n))
+        (drop (call $fd_write (i32.const 1) (i32.const 16) (i32.const 1) (i32.const 24)))))
+    "#;
+
+    // A javy-free stand-in for a dynamically-linked module: it declares no memory
+    // of its own, imports the shared plugin's `memory`/`cabi_realloc`/`invoke`
+    // under a NON-default namespace (so the host can't be hard-coding the real
+    // "javy-default-plugin-v4"), and its `_start` just drives `invoke`.
+    const FAKE_DYN_MODULE_WAT: &str = r#"
+    (module
+      (import "fpui-test-plugin" "memory" (memory 0))
+      (import "fpui-test-plugin" "cabi_realloc"
+        (func $realloc (param i32 i32 i32 i32) (result i32)))
+      (import "fpui-test-plugin" "invoke"
+        (func $invoke (param i32 i32 i32 i32 i32)))
+      (func (export "_start")
+        (call $invoke (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0))))
+    "#;
+
+    #[test]
+    fn a_dynamic_module_runs_on_the_shared_engine() {
+        let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
+        let mut js = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        // The tiny module shares the plugin's memory and calls its `invoke`, which
+        // echoes the framed stdin — so the host gets the whole frame back. Proves
+        // the shared-engine hosting chain: instantiate the plugin, wire its memory
+        // and funcs into the module, run `_start`, read stdout.
+        let out = js.transform("message", b"dyn hi").unwrap();
+        assert_eq!(out, frame("message", b"dyn hi"));
+    }
+
+    #[test]
+    fn the_runtime_hosts_many_modules_from_one_shared_plugin() {
+        // The footprint win: one compiled plugin, many tiny modules.
+        let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
+        let mut a = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        let mut b = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        assert_eq!(a.transform("x", b"one").unwrap(), frame("x", b"one"));
+        assert_eq!(b.transform("y", b"two").unwrap(), frame("y", b"two"));
+    }
+
+    #[test]
+    fn the_runtime_rejects_a_non_module() {
+        let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
+        assert!(matches!(runtime.load(b"not wasm"), Err(WasmError::Compile(_))));
     }
 }
