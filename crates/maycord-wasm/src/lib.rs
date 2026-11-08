@@ -26,7 +26,7 @@
 //! The host allocates the input with `maycord_alloc`, writes it, calls the
 //! transform, and reads the result back out of the guest's memory.
 
-use maycord_host::{Draft, Message, Plugin};
+use maycord_host::{Draft, Event, Message, Plugin};
 use wasmi::{Config, Engine, Linker, Memory, Module, Store, TypedFunc};
 
 /// Fuel spent per hook call before the guest is trapped. Generous for a text
@@ -36,6 +36,41 @@ pub const DEFAULT_FUEL: u64 = 50_000_000;
 /// The largest output a guest may return from a transform, capping memory a
 /// malicious module can make the host allocate.
 const MAX_OUTPUT: usize = 16 * 1024 * 1024;
+
+/// Serialize an observed event into the versioned JSON the guest receives. The
+/// `v` field lets the ABI grow without breaking older plugins.
+fn event_json(event: &Event) -> String {
+    match event {
+        Event::Ready => r#"{"v":1,"type":"ready"}"#.to_string(),
+        Event::MessageDisplayed { author } => format!(
+            r#"{{"v":1,"type":"message_displayed","author":{}}}"#,
+            json_string(author)
+        ),
+        Event::Shutdown => r#"{"v":1,"type":"shutdown"}"#.to_string(),
+        // `Event` is non-exhaustive; an unknown event still reaches the plugin
+        // as a well-formed, ignorable value rather than a malformed one.
+        _ => r#"{"v":1,"type":"unknown"}"#.to_string(),
+    }
+}
+
+/// A quoted, escaped JSON string literal for `s`.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 /// Why a wasm module could not be loaded as a plugin.
 #[derive(Debug)]
@@ -68,6 +103,7 @@ pub struct WasmPlugin {
     alloc: Option<TypedFunc<i32, i32>>,
     transform_message: Option<TypedFunc<(i32, i32), i64>>,
     transform_draft: Option<TypedFunc<(i32, i32), i64>>,
+    on_event: Option<TypedFunc<(i32, i32), ()>>,
     fuel_per_call: u64,
 }
 
@@ -103,6 +139,9 @@ impl WasmPlugin {
         let transform_draft = instance
             .get_typed_func::<(i32, i32), i64>(&store, "maycord_transform_draft")
             .ok();
+        let on_event = instance
+            .get_typed_func::<(i32, i32), ()>(&store, "maycord_on_event")
+            .ok();
 
         Ok(Self {
             store,
@@ -110,6 +149,7 @@ impl WasmPlugin {
             alloc,
             transform_message,
             transform_draft,
+            on_event,
             fuel_per_call,
         })
     }
@@ -143,6 +183,24 @@ impl WasmPlugin {
         memory.read(&self.store, out_ptr, &mut buf).ok()?;
         String::from_utf8(buf).ok()
     }
+
+    /// Hand a serialized event to the guest. Returns `None` on any trap,
+    /// out-of-fuel, or protocol error; an event a plugin fails to handle is
+    /// simply dropped.
+    fn deliver_event(&mut self, func: TypedFunc<(i32, i32), ()>, json: &str) -> Option<()> {
+        let alloc = self.alloc?;
+        let memory = self.memory;
+        self.store.set_fuel(self.fuel_per_call).ok()?;
+        let bytes = json.as_bytes();
+        let len = i32::try_from(bytes.len()).ok()?;
+        let ptr = alloc.call(&mut self.store, len).ok()?;
+        if ptr < 0 {
+            return None;
+        }
+        memory.write(&mut self.store, ptr as usize, bytes).ok()?;
+        func.call(&mut self.store, (ptr, len)).ok()?;
+        Some(())
+    }
 }
 
 impl Plugin for WasmPlugin {
@@ -163,6 +221,14 @@ impl Plugin for WasmPlugin {
         if let Some(rewritten) = self.run_transform(func, &draft.text) {
             draft.text = rewritten;
         }
+    }
+
+    fn on_event(&mut self, event: &Event) {
+        let Some(func) = self.on_event else {
+            return;
+        };
+        let json = event_json(event);
+        let _ = self.deliver_event(func, &json);
     }
 }
 
@@ -237,6 +303,20 @@ mod tests {
         (i64.or
           (i64.shl (i64.extend_i32_u (local.get $out)) (i64.const 32))
           (i64.extend_i32_u (local.get $len)))))
+    "#;
+
+    // Records the received event length at memory[0] so a test can see it ran.
+    const ON_EVENT_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1)
+      (global $heap (mut i32) (i32.const 1024))
+      (func (export "maycord_alloc") (param $n i32) (result i32)
+        (local $p i32)
+        (local.set $p (global.get $heap))
+        (global.set $heap (i32.add (global.get $heap) (local.get $n)))
+        (local.get $p))
+      (func (export "maycord_on_event") (param $ptr i32) (param $len i32)
+        (i32.store (i32.const 0) (local.get $len))))
     "#;
 
     fn manifest(caps: &[Capability]) -> Manifest {
@@ -323,5 +403,37 @@ mod tests {
         let mut d = maycord_host::Draft { text: "hi".into() };
         host.edit_draft(&mut d);
         assert_eq!(d.text, "HI");
+    }
+
+    #[test]
+    fn event_json_is_versioned_and_escaped() {
+        assert_eq!(event_json(&Event::Ready), r#"{"v":1,"type":"ready"}"#);
+        assert_eq!(event_json(&Event::Shutdown), r#"{"v":1,"type":"shutdown"}"#);
+        assert_eq!(
+            event_json(&Event::MessageDisplayed { author: "a\"b".into() }),
+            r#"{"v":1,"type":"message_displayed","author":"a\"b"}"#
+        );
+    }
+
+    #[test]
+    fn on_event_delivers_the_serialized_event_to_the_guest() {
+        let wasm = wat::parse_str(ON_EVENT_WAT).unwrap();
+        let mut plugin = WasmPlugin::load(&wasm).unwrap();
+        plugin.on_event(&Event::Ready);
+        // The guest recorded the event's byte length at memory[0]; read it back.
+        let mut buf = [0u8; 4];
+        plugin.memory.read(&plugin.store, 0, &mut buf).unwrap();
+        assert_eq!(i32::from_le_bytes(buf) as usize, event_json(&Event::Ready).len());
+    }
+
+    #[test]
+    fn host_broadcast_reaches_the_wasm_event_hook() {
+        let wasm = wat::parse_str(ON_EVENT_WAT).unwrap();
+        let plugin = WasmPlugin::load(&wasm).unwrap();
+        let mut host = Host::new();
+        host.register(&manifest(&[Capability::Events]), &[Capability::Events], Box::new(plugin))
+            .unwrap();
+        host.broadcast(&Event::Ready); // Events-gated path delivers without panic.
+        assert_eq!(host.len(), 1);
     }
 }

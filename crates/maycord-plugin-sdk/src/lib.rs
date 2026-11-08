@@ -51,6 +51,19 @@ pub fn run_transform<F: FnOnce(&str) -> String>(ptr: i32, len: i32, transform: F
     (((out_ptr as u64) << 32) | out_len as u64) as i64
 }
 
+/// The glue behind `plugin!`'s `on_event` hook: read the versioned-JSON event
+/// the host wrote and hand it to the author's handler. Events are observe-only,
+/// so the handler returns nothing.
+pub fn run_event<F: FnOnce(&str)>(ptr: i32, len: i32, handler: F) {
+    let len = len.max(0) as usize;
+    // SAFETY: `ptr`/`len` name the buffer the host got from `alloc` and filled
+    // with the event JSON before calling us; we take it back to free it.
+    let input = unsafe { Vec::from_raw_parts(ptr as *mut u8, len, len) };
+    let json = String::from_utf8_lossy(&input).into_owned();
+    drop(input);
+    handler(&json);
+}
+
 /// Define a maycord plugin. List the hooks you want; the macro emits the wasm
 /// exports maycord's host calls. Each hook takes the input `&str` and returns
 /// the rewritten `String`.
@@ -93,6 +106,14 @@ macro_rules! __maycord_hook {
         #[no_mangle]
         pub extern "C" fn maycord_transform_draft(ptr: i32, len: i32) -> i64 {
             $crate::run_transform(ptr, len, $f)
+        }
+    };
+    (on_event, $f:expr) => {
+        /// Observe an event: the host wrote the versioned-JSON event at `ptr..ptr+len`.
+        /// The handler takes the JSON `&str` and returns nothing.
+        #[no_mangle]
+        pub extern "C" fn maycord_on_event(ptr: i32, len: i32) {
+            $crate::run_event(ptr, len, $f)
         }
     };
 }
