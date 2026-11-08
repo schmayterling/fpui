@@ -458,6 +458,7 @@ pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter,
     recover_signed!(resolved.replaces, token);
     recover_signed!(resolved.appends, token);
     recover_signed!(resolved.patches, token);
+    recover_signed!(resolved.paints, token);
 
     (resolved, dropped)
 }
@@ -480,6 +481,7 @@ fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped:
         .chain(resolved.args.iter().filter_map(|a| a.anchor.as_ref()))
         .chain(resolved.replaces.iter().filter_map(|p| p.anchor.as_ref()))
         .chain(resolved.appends.iter().filter_map(|a| a.anchor.as_ref()))
+        .chain(resolved.paints.iter().filter_map(|p| p.anchor.as_ref()))
         .map(|a| a.text.as_str())
         .collect();
     if texts.is_empty() {
@@ -561,6 +563,21 @@ fn resolve_anchored_entries(resolved: &mut TargetAdapter, image: &[u8], dropped:
             }
             _ => {
                 dropped.push(a.token.clone());
+                false
+            }
+        }
+    });
+    resolved.paints.retain_mut(|p| {
+        if p.anchor.is_none() {
+            return true;
+        }
+        match anchors.next() {
+            Some(Ok(hit)) => {
+                p.image_offset = hit.func_offset;
+                true
+            }
+            _ => {
+                dropped.push(p.token.clone());
                 false
             }
         }
@@ -716,6 +733,7 @@ mod tests {
             replaces: vec![],
             patches: vec![],
             appends: vec![],
+            paints: vec![],
         }
     }
 

@@ -502,6 +502,11 @@ pub struct TargetAdapter {
     /// a list entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub appends: Vec<ListAppendSite>,
+    /// Paint primitives to inject by re-invoking a paint function the target
+    /// calls each frame (e.g. a quad into gpui's live scene). Empty unless the
+    /// adapter draws into the target's own renderer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paints: Vec<PaintSite>,
 }
 
 /// How one field of an appended element is filled in at load time — the real
@@ -567,6 +572,49 @@ impl ListAppendSite {
     }
 }
 
+/// A paint primitive to inject by re-invoking a paint function the target
+/// already calls each frame (e.g. gpui `Window::paint_quad`). On a real call the
+/// agent holds the target's own live render context (an argument), so
+/// re-invoking the original with a crafted primitive appends it to the live
+/// scene — the data-driven alternative to synthesising a GPUI `Element` across
+/// the no-stable-ABI wall (proven in the `fpui-paint-inject` spike).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaintSite {
+    /// A label for logs (e.g. `"support-card-quad"`).
+    pub token: String,
+    /// Image-relative entry of the paint function (e.g. `paint_quad`).
+    pub image_offset: u64,
+    /// The exact bytes expected there; the loader refuses to detour on mismatch.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// Which argument index holds the live render-context pointer to re-invoke
+    /// with (gpui paint fns take `&mut Window` as argument 0).
+    pub context_arg: u8,
+    /// Which argument index takes the primitive pointer (gpui `paint_quad` takes
+    /// `&Quad` as argument 1).
+    pub primitive_arg: u8,
+    /// The raw bytes of one `repr(C)` primitive (e.g. a `Quad`) to inject,
+    /// pointer fields left as placeholders that `fixups` fill in.
+    #[serde(with = "hex_bytes")]
+    pub primitive: Vec<u8>,
+    /// How to fill the primitive's pointer fields once real addresses are known.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fixups: Vec<ElementFixup>,
+    /// Optional signature to relocate the entry when the build has drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+    /// Optional string anchor to re-find the entry when the build has drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StringAnchor>,
+}
+
+impl PaintSite {
+    /// The runtime address of the paint function given the load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
+}
+
 impl TargetAdapter {
     /// Check the adapter makes sense on its own: it has at least one site and no
     /// two sites claim the same token. Call this once when loading an adapter,
@@ -579,6 +627,7 @@ impl TargetAdapter {
             && self.args.is_empty()
             && self.replaces.is_empty()
             && self.appends.is_empty()
+            && self.paints.is_empty()
         {
             return Err(VerifyError::NoSites);
         }
@@ -714,6 +763,7 @@ mod tests {
             replaces: vec![],
             patches: vec![],
             appends: vec![],
+            paints: vec![],
         }
     }
 
