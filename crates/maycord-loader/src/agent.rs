@@ -446,6 +446,144 @@ mod frida_backend {
         Box::leak(Box::new((gum, interceptor)));
         Ok(())
     }
+
+    extern "C" {
+        /// Flush the CPU instruction cache for `len` bytes at `start`. arm64 has
+        /// split instruction/data caches, so a freshly written code byte is not
+        /// executed until the stale i-cache line is invalidated. Declared from
+        /// libSystem's `<libkern/OSCacheControl.h>`.
+        fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
+
+        /// Set the protection of a range in a task. We can't use `mprotect`:
+        /// apple-silicon refuses to make a code-signed `__TEXT` page writable
+        /// that way. `VM_PROT_COPY` here forces a private, writable copy of the
+        /// page instead, which is the supported way to edit mapped code. From
+        /// `<mach/mach_vm.h>`, resolved in libSystem.
+        fn mach_vm_protect(
+            target_task: libc::vm_map_t,
+            address: libc::mach_vm_address_t,
+            size: libc::mach_vm_size_t,
+            set_maximum: libc::boolean_t,
+            new_protection: libc::vm_prot_t,
+        ) -> libc::kern_return_t;
+    }
+
+    const VM_PROT_READ: libc::vm_prot_t = 0x1;
+    const VM_PROT_WRITE: libc::vm_prot_t = 0x2;
+    const VM_PROT_EXECUTE: libc::vm_prot_t = 0x4;
+    /// OR'd into the new protection, forces a copy-on-write copy of the range so
+    /// a code-signed, file-backed page can be made writable.
+    const VM_PROT_COPY: libc::vm_prot_t = 0x10;
+
+    /// This host's page size, to align a protection range. Falls back to 16 KiB
+    /// (apple-silicon's size) if the query ever fails.
+    fn page_size() -> usize {
+        // SAFETY: `sysconf` is always callable; `_SC_PAGESIZE` returns the size.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if n > 0 {
+            n as usize
+        } else {
+            16 * 1024
+        }
+    }
+
+    /// Overwrite the `bytes.len()` bytes at `addr` in the running image. A
+    /// BytePatch site sits in the target's own `__TEXT` segment — a drawn string
+    /// literal in `__TEXT,__cstring`/`__const`, or a function entry in
+    /// `__TEXT,__text` — which the kernel maps read+execute. apple-silicon won't
+    /// let a page be writable and executable at once, and refuses `mprotect`
+    /// write on a code-signed page at all, so we take the range writable with
+    /// `VM_PROT_COPY` (a private read/write copy, no execute), copy the
+    /// replacement in, invalidate the i-cache for the range (required before the
+    /// CPU runs an overwritten instruction), then restore the pages to the
+    /// read+execute they began with. This edits the target's existing pages in
+    /// place; it never maps new executable memory.
+    #[allow(deprecated)] // libc prefers the mach2 crate's binding; the task-self trap is stable.
+    fn write_in_place(addr: u64, bytes: &[u8]) -> io::Result<()> {
+        let page = page_size();
+        let start = (addr as usize) & !(page - 1);
+        let end = (addr as usize + bytes.len() + page - 1) & !(page - 1);
+        let span = (end - start) as libc::mach_vm_size_t;
+        // SAFETY: `start..end` is the page-aligned span covering `[addr,
+        // addr+len)`, which the caller just re-verified still holds the pinned
+        // `expected_bytes`. We take those pages writable as a private copy, write
+        // exactly `bytes.len()` bytes (the site's own length-preserving
+        // replacement), flush the i-cache for that range, then restore r-x. Every
+        // pointer is into the target's own mapped image, and `mach_task_self()`
+        // is this process's own task port.
+        unsafe {
+            let task = libc::mach_task_self();
+            let kr = mach_vm_protect(
+                task,
+                start as libc::mach_vm_address_t,
+                span,
+                0,
+                VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY,
+            );
+            if kr != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("vm_protect writable failed: kr={kr}"),
+                ));
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len());
+            sys_icache_invalidate(addr as *mut libc::c_void, bytes.len());
+            let kr = mach_vm_protect(
+                task,
+                start as libc::mach_vm_address_t,
+                span,
+                0,
+                VM_PROT_READ | VM_PROT_EXECUTE,
+            );
+            if kr != 0 {
+                return Err(io::Error::other(format!("vm_protect restore failed: kr={kr}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply every same-length byte overwrite in `adapter` to the live image.
+    /// Unlike the colour and detour sites, a byte patch is not a frida probe: it
+    /// rewrites the target's own `__TEXT` bytes in place, which is how maycord
+    /// injects UI text (overwrite a drawn string) or neutralises a function
+    /// (write a force-return over its entry). Each site is re-verified against
+    /// its pinned `expected_bytes` at the live address first; on any mismatch the
+    /// site is skipped with a note and never written, so a drifted build is
+    /// reported, not scribbled on. One failed site does not stop the rest.
+    pub fn apply_byte_patches(adapter: &TargetAdapter, image_base: u64) {
+        for patch in &adapter.patches {
+            if !patch.is_length_preserving() {
+                // validate() already rejects this; guard anyway so a write can
+                // never change the length and shift the bytes after the site.
+                eprintln!(
+                    "maycord: skipping byte patch `{}`; replacement length differs",
+                    patch.token
+                );
+                continue;
+            }
+            let addr = patch.runtime_addr(image_base);
+            let len = patch.expected_bytes.len();
+            // SAFETY: a read-only compare of exactly `len` bytes at a verified
+            // image offset — the gate that refuses to write on a wrong build.
+            let live = unsafe { std::slice::from_raw_parts(addr as *const u8, len) };
+            if live != patch.expected_bytes.as_slice() {
+                eprintln!(
+                    "maycord: skipping byte patch `{}` at {addr:#x}; pinned bytes moved",
+                    patch.token
+                );
+                continue;
+            }
+            match write_in_place(addr, &patch.replacement_bytes) {
+                Ok(()) => {
+                    eprintln!("maycord: byte patch `{}` applied at {addr:#x}", patch.token)
+                }
+                Err(e) => eprintln!(
+                    "maycord: byte patch `{}` at {addr:#x} failed: {e}",
+                    patch.token
+                ),
+            }
+        }
+    }
 }
 
 /// Where the main executable is loaded in memory (its preferred base plus the
@@ -560,6 +698,15 @@ pub fn run() -> io::Result<()> {
                 return Err(e);
             }
         }
+    }
+
+    // Byte patches are same-length overwrites of the target's own __TEXT bytes:
+    // inject UI text, neutralise a function. They are not detours, so they run on
+    // their own right after the colour writes. Each site re-verifies its pinned
+    // bytes live before writing, so a drifted site is skipped, not forced.
+    #[cfg(all(target_os = "macos", feature = "frida"))]
+    if !adapter.patches.is_empty() {
+        frida_backend::apply_byte_patches(&adapter, base);
     }
 
     // Return overrides need no plugins and no event channel: they detour a
