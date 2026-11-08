@@ -1,0 +1,13 @@
+[package]
+name = "maycord-install"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Wrap a macOS app so it auto-loads the maycord agent on launch (via Info.plist LSEnvironment + an ad-hoc re-sign), and unwrap it again."
+
+[dependencies]
+plist = "1"
+
+[lints]
+workspace = true
