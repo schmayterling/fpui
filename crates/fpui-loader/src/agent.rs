@@ -748,18 +748,29 @@ pub fn run() -> io::Result<()> {
     // (its on-disk layout matches the loaded image) and scan for each site's
     // signature; sites we can't find are dropped with a note. If we can't read
     // our own image, fall back to the adapter's exact pinned offsets.
-    let adapter = match std::env::current_exe().and_then(std::fs::read) {
-        Ok(image) => {
-            let (resolved, dropped) = resolve_adapter(&adapter, &image);
-            for label in &dropped {
-                eprintln!("fpui: patch `{label}` not found in this build; skipping");
-            }
-            resolved
+    // Fail closed on identity: read our own on-disk image and refuse to patch
+    // blind if we can't. A non-exact build is NOT rejected (drift survival is the
+    // point — anchors/signatures re-resolve and every site is byte-checked live),
+    // but it is reported, and we never fall back to un-resolved pinned offsets
+    // against an image we couldn't read.
+    let image = std::env::current_exe().and_then(std::fs::read).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("cannot read own image for the identity check; refusing to patch blind: {e}"),
+        )
+    })?;
+    if let Err(e) = adapter.identity.verify_file(&image) {
+        eprintln!(
+            "fpui: target is not the exact pinned build ({e}); relying on anchor/signature \
+             re-resolution and the per-site byte check"
+        );
+    }
+    let adapter = {
+        let (resolved, dropped) = resolve_adapter(&adapter, &image);
+        for label in &dropped {
+            eprintln!("fpui: patch `{label}` not found in this build; skipping");
         }
-        Err(e) => {
-            eprintln!("fpui: could not read own image ({e}); using pinned offsets");
-            adapter
-        }
+        resolved
     };
     let plan = plan_writes(&adapter, variant, base);
     // Run on any version: check each site live, patch the ones that still match,
