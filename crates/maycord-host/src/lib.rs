@@ -63,9 +63,13 @@ use maycord_manifest::{Capability, ExtensionKind, Manifest, ManifestError};
 pub enum Event {
     /// The host finished loading every plugin and the client is ready.
     Ready,
-    /// A message became visible in the current channel. Observe-only; to change
-    /// what renders, implement [`Plugin::transform_message`] instead.
-    MessageDisplayed { author: String, content: String },
+    /// A message became visible in the current channel, identified by its
+    /// `author` only. This is an [`Events`](Capability::Events) signal, so it
+    /// deliberately carries no message text: reading or transforming content
+    /// requires [`Capability::MessageContent`] through
+    /// [`Plugin::transform_message`]. Observing presence must never become a
+    /// backdoor to content a plugin was not granted.
+    MessageDisplayed { author: String },
     /// The client is shutting down; the plugin's last chance to flush state.
     Shutdown,
 }
@@ -320,8 +324,38 @@ mod tests {
         // A second plugin without Events must not see the broadcast.
         host.register(&manifest("mute", &[Capability::MessageContent]), &[Capability::MessageContent], Box::new(Spy::default())).unwrap();
         host.broadcast(&Event::Ready);
+        host.broadcast(&Event::MessageDisplayed { author: "alice".into() });
         host.broadcast(&Event::Shutdown);
-        assert_eq!(*seen.borrow(), vec![Event::Ready, Event::Shutdown]);
+        assert_eq!(
+            *seen.borrow(),
+            vec![
+                Event::Ready,
+                Event::MessageDisplayed { author: "alice".into() },
+                Event::Shutdown
+            ]
+        );
+    }
+
+    #[test]
+    fn events_payload_carries_no_message_content() {
+        // Regression guard for a capability leak: an Events-only observer must
+        // never receive message text. MessageDisplayed is metadata (author)
+        // only; content is reachable solely through the MessageContent
+        // transform path, which this plugin was not granted.
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut host = Host::new();
+        host.register(
+            &manifest("obs", &[Capability::Events]),
+            &[Capability::Events],
+            Box::new(Spy { events: seen.clone() }),
+        )
+        .unwrap();
+        host.broadcast(&Event::MessageDisplayed { author: "bob".into() });
+        let events = seen.borrow();
+        match &events[0] {
+            Event::MessageDisplayed { author } => assert_eq!(author, "bob"),
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
