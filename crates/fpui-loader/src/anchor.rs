@@ -158,8 +158,8 @@ pub fn resolve_anchors(
     let mut loc_first_xref: Vec<Option<u64>> = vec![None; needles.len()];
     if !targets.is_empty() || !loc_targets.is_empty() {
         let mut prev: Option<(usize, u32)> = None;
-        for (idx, chunk) in data.chunks_exact(4).enumerate() {
-            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        for (idx, chunk) in data.as_chunks::<4>().0.iter().enumerate() {
+            let word = u32::from_le_bytes(*chunk);
             if let Some((adrp_idx, adrp_word)) = prev {
                 let pc = text_vmaddr + (adrp_idx as u64) * 4;
                 if let (Some((rd, page)), Some((add_rd, add_rn, val))) =

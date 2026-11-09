@@ -641,8 +641,10 @@ fn unhex(s: &str) -> Result<Vec<u8>, String> {
         return Err(format!("hex string has odd length {}", bytes.len()));
     }
     bytes
-        .chunks_exact(2)
-        .map(|pair| Ok((hex_digit(pair[0])? << 4) | hex_digit(pair[1])?))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|[a, b]| Ok((hex_digit(*a)? << 4) | hex_digit(*b)?))
         .collect()
 }
 
@@ -720,7 +722,10 @@ mod tests {
     #[test]
     fn verify_accepts_the_exact_bytes_and_rejects_anything_else() {
         let a = adapter();
-        assert_eq!(a.identity.verify_file(b"the exact bytes of the target"), Ok(()));
+        assert_eq!(
+            a.identity.verify_file(b"the exact bytes of the target"),
+            Ok(())
+        );
         match a.identity.verify_file(b"a different build") {
             Err(VerifyError::Sha256Mismatch { .. }) => {}
             other => panic!("expected mismatch, got {other:?}"),
@@ -764,7 +769,10 @@ mod tests {
         let mut dup = a.sites[0].clone();
         dup.image_offset = 0x999;
         a.sites.push(dup);
-        assert_eq!(a.validate(), Err(VerifyError::DuplicateToken("sidebar".into())));
+        assert_eq!(
+            a.validate(),
+            Err(VerifyError::DuplicateToken("sidebar".into()))
+        );
     }
 
     #[test]
@@ -776,8 +784,14 @@ mod tests {
             hook: "message-received".into(),
             capability: "events".into(),
             args: vec![
-                StringArg { ptr_arg: 0, len_arg: 1 },
-                StringArg { ptr_arg: 2, len_arg: 3 },
+                StringArg {
+                    ptr_arg: 0,
+                    len_arg: 1,
+                },
+                StringArg {
+                    ptr_arg: 2,
+                    len_arg: 3,
+                },
             ],
             signature: None,
             anchor: None,
@@ -884,10 +898,15 @@ mod tests {
             expected_len: 15,
             element: vec![0; 32],
             fixups: vec![
-                ElementFixup::StaticBlob { offset: 0, bytes: b"fpui".to_vec() },
+                ElementFixup::StaticBlob {
+                    offset: 0,
+                    bytes: b"fpui".to_vec(),
+                },
                 ElementFixup::TargetFn {
                     offset: 24,
-                    anchor: StringAnchor { text: "render_empty".into() },
+                    anchor: StringAnchor {
+                        text: "render_empty".into(),
+                    },
                 },
             ],
             signature: None,

@@ -883,6 +883,7 @@ pub fn main_image_base() -> Option<u64> {
     ) -> libc::c_int {
         // SAFETY: `data` is the `&mut u64` we passed below; store the first
         // object's load bias and stop the walk by returning non-zero.
+        #[allow(clippy::unnecessary_cast, reason = "32/64 bit systems")]
         unsafe { *(data as *mut u64) = (*info).dlpi_addr as u64 };
         1
     }
