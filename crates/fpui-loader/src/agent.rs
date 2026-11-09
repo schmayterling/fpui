@@ -950,7 +950,10 @@ mod frida_backend {
             let addr = patch.runtime_addr(image_base);
             let len = patch.expected_bytes.len();
             if !super::in_image(addr, len) {
-                eprintln!("fpui: skipping byte patch `{}`; offset escapes the image", patch.token);
+                eprintln!(
+                    "fpui: skipping byte patch `{}`; offset escapes the image",
+                    patch.token
+                );
                 continue;
             }
             // SAFETY: a read-only compare of exactly `len` bytes at a verified

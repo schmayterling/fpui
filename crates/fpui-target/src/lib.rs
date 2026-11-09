@@ -999,7 +999,10 @@ mod tests {
                         text: "Support The Project".into(),
                         style: ElementStyle::default(),
                     },
-                    ElementNode::Button { text: "Donate".into(), style: ElementStyle::default() },
+                    ElementNode::Button {
+                        text: "Donate".into(),
+                        style: ElementStyle::default(),
+                    },
                 ],
             },
             signature: None,

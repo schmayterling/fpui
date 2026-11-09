@@ -451,7 +451,12 @@ pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter,
                 if s.signature.is_none() {
                     return true;
                 }
-                match locate(image, s.image_offset, &s.expected_bytes, s.signature.as_ref()) {
+                match locate(
+                    image,
+                    s.image_offset,
+                    &s.expected_bytes,
+                    s.signature.as_ref(),
+                ) {
                     Located::At(off) => {
                         s.image_offset = off;
                         true
@@ -1113,7 +1118,10 @@ mod tests {
                 image_offset: 8, // wrong; the signature recovers it to 60
                 expected_bytes: EXPECT.to_vec(),
                 op: ReturnOp::InvertBool,
-                signature: Some(Signature { bytes: EXPECT.to_vec(), site_offset: 0 }),
+                signature: Some(Signature {
+                    bytes: EXPECT.to_vec(),
+                    site_offset: 0,
+                }),
                 anchor: None,
             },
             ReturnSite {
@@ -1128,9 +1136,18 @@ mod tests {
 
         let (resolved, dropped) = resolve_adapter(&adapter, &build);
 
-        assert!(dropped.is_empty(), "the un-signed return defers to the live check");
+        assert!(
+            dropped.is_empty(),
+            "the un-signed return defers to the live check"
+        );
         assert_eq!(resolved.returns.len(), 2);
-        assert_eq!(resolved.returns[0].image_offset, 60, "signature recovered the drift");
-        assert_eq!(resolved.returns[1].image_offset, 999, "un-signed left untouched");
+        assert_eq!(
+            resolved.returns[0].image_offset, 60,
+            "signature recovered the drift"
+        );
+        assert_eq!(
+            resolved.returns[1].image_offset, 999,
+            "un-signed left untouched"
+        );
     }
 }
