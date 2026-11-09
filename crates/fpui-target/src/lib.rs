@@ -507,6 +507,10 @@ pub struct TargetAdapter {
     /// adapter draws into the target's own renderer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub paints: Vec<PaintSite>,
+    /// Native element trees to inject by re-invoking the target's own gpui
+    /// builders at a render seam. Empty unless the adapter renders native UI.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub elements: Vec<ElementSite>,
 }
 
 /// How one field of an appended element is filled in at load time — the real
@@ -615,6 +619,118 @@ impl PaintSite {
     }
 }
 
+/// The subset of gpui style fields fpui writes into a built element's
+/// `StyleRefinement`. Lengths are logical pixels (converted to `Pixels`/`f32`
+/// when applied); colour is RGBA. Integer-only so the adapter stays `Eq`; grows
+/// as more style rungs are proven on a target.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementStyle {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<[u8; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub padding_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corner_radius_px: Option<u32>,
+    #[serde(default)]
+    pub flex_col: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gap_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width_px: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height_px: Option<u32>,
+}
+
+impl ElementStyle {
+    fn is_default(&self) -> bool {
+        self == &ElementStyle::default()
+    }
+}
+
+/// One node of the declarative element tree an [`ElementSite`] builds by
+/// re-invoking the target's own builders. The tree is general; only the builder
+/// addresses are per-target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElementNode {
+    /// A styled flex container (`div()` + style, with children).
+    Div {
+        #[serde(default, skip_serializing_if = "ElementStyle::is_default")]
+        style: ElementStyle,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        children: Vec<ElementNode>,
+    },
+    /// A text run (`Label::new(text)`).
+    Label {
+        text: String,
+        #[serde(default, skip_serializing_if = "ElementStyle::is_default")]
+        style: ElementStyle,
+    },
+    /// A button (`Button::new`); click behaviour is a later rung.
+    Button {
+        text: String,
+        #[serde(default, skip_serializing_if = "ElementStyle::is_default")]
+        style: ElementStyle,
+    },
+}
+
+/// Per-target image-relative entries of the UI builders an [`ElementSite`]
+/// re-invokes. Found per build (live-traced); everything else is a general
+/// declarative spec. `div`/`style`/`into_any` cover a styled container; the rest
+/// are filled as richer trees are proven.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementBuilders {
+    /// `div() -> Div` (no args, returned via sret).
+    pub div: u64,
+    /// `<Div as Styled>::style(&mut self) -> &mut StyleRefinement`.
+    pub style: u64,
+    /// `IntoElement::into_any_element(self) -> AnyElement`.
+    pub into_any: u64,
+    /// `Label::new(impl Into<SharedString>) -> Label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_new: Option<u64>,
+    /// `ParentElement::child(self, child)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child: Option<u64>,
+    /// `Button::new(id, label) -> Button`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub button_new: Option<u64>,
+}
+
+/// A native element tree to inject by re-invoking the target's own gpui builders
+/// at a render seam — the data-driven, parity-stable alternative to painting
+/// pixels. The builder addresses are per-target pins; the [`tree`](Self::tree)
+/// is a general spec, so the same capability renders native UI in any gpui app
+/// once its builders are pinned. (The re-invoke apply is proven rung-by-rung on
+/// the Zed testbed before it is wired live.)
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElementSite {
+    /// A label for logs (e.g. `"support-card"`).
+    pub token: String,
+    /// Image-relative entry of the render function to detour (it returns the
+    /// `AnyElement` fpui replaces with the built tree).
+    pub image_offset: u64,
+    /// The exact bytes expected there; the loader refuses to detour on mismatch.
+    #[serde(with = "hex_bytes")]
+    pub expected_bytes: Vec<u8>,
+    /// The target's own builder addresses to re-invoke.
+    pub builders: ElementBuilders,
+    /// The element tree to build and return from the render fn.
+    pub tree: ElementNode,
+    /// Optional signature to relocate the render fn when the build has drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Signature>,
+    /// Optional string anchor to re-find the render fn when the build has drifted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<StringAnchor>,
+}
+
+impl ElementSite {
+    /// The runtime address of the render function given the load base.
+    pub fn runtime_addr(&self, image_base: u64) -> u64 {
+        image_base.wrapping_add(self.image_offset)
+    }
+}
+
 impl TargetAdapter {
     /// Check the adapter makes sense on its own: it has at least one site and no
     /// two sites claim the same token. Call this once when loading an adapter,
@@ -628,6 +744,7 @@ impl TargetAdapter {
             && self.replaces.is_empty()
             && self.appends.is_empty()
             && self.paints.is_empty()
+            && self.elements.is_empty()
         {
             return Err(VerifyError::NoSites);
         }
@@ -764,6 +881,7 @@ mod tests {
             patches: vec![],
             appends: vec![],
             paints: vec![],
+            elements: vec![],
         }
     }
 
@@ -835,6 +953,47 @@ mod tests {
         let json = serde_json::to_string(&a).unwrap();
         assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
         assert_eq!(a.events[0].runtime_addr(0x1_0000_0000), 0x1_0000_4000);
+    }
+
+    #[test]
+    fn an_element_site_round_trips_with_a_nested_tree() {
+        let mut a = adapter();
+        a.elements = vec![ElementSite {
+            token: "support-card".into(),
+            image_offset: 0x3997f1c,
+            expected_bytes: vec![0xff, 0x43, 0x00, 0xd1],
+            builders: ElementBuilders {
+                div: 0x1000,
+                style: 0x2000,
+                into_any: 0x3000,
+                label_new: Some(0x4000),
+                child: Some(0x5000),
+                button_new: None,
+            },
+            tree: ElementNode::Div {
+                style: ElementStyle {
+                    background: Some([156, 133, 239, 255]),
+                    padding_px: Some(12),
+                    corner_radius_px: Some(8),
+                    flex_col: true,
+                    gap_px: Some(8),
+                    width_px: None,
+                    height_px: None,
+                },
+                children: vec![
+                    ElementNode::Label {
+                        text: "Support The Project".into(),
+                        style: ElementStyle::default(),
+                    },
+                    ElementNode::Button { text: "Donate".into(), style: ElementStyle::default() },
+                ],
+            },
+            signature: None,
+            anchor: None,
+        }];
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(serde_json::from_str::<TargetAdapter>(&json).unwrap(), a);
+        assert_eq!(a.elements[0].runtime_addr(0x1_0000_0000), 0x1_0399_7f1c);
     }
 
     #[test]
