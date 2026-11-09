@@ -45,7 +45,12 @@ fn parse(args: &[String]) -> Option<Cli<'_>> {
         }
     }
     match positional.as_slice() {
-        [adapter, binary] => Some(Cli { adapter, binary, as_json, label }),
+        [adapter, binary] => Some(Cli {
+            adapter,
+            binary,
+            as_json,
+            label,
+        }),
         _ => None,
     }
 }
@@ -112,9 +117,17 @@ fn print_text(report: &PatchReport, label: Option<&str>) {
     println!("  build sha256:       {}", hex(&report.sha256));
     println!(
         "  exact pinned build: {}",
-        if report.identity_matches { "yes" } else { "no (a different version)" }
+        if report.identity_matches {
+            "yes"
+        } else {
+            "no (a different version)"
+        }
     );
-    println!("  patches:            {}/{} supported", report.supported(), report.patches.len());
+    println!(
+        "  patches:            {}/{} supported",
+        report.supported(),
+        report.patches.len()
+    );
     println!();
     for p in &report.patches {
         let tag = if p.supported { " ok  " } else { "BROKEN" };
@@ -142,10 +155,16 @@ fn print_json(report: &PatchReport, label: Option<&str>) {
         .patches
         .iter()
         .map(|p| {
-            let resolved = p.resolved_offset.map_or_else(|| "null".to_string(), |o| o.to_string());
+            let resolved = p
+                .resolved_offset
+                .map_or_else(|| "null".to_string(), |o| o.to_string());
             format!(
                 r#"{{"label":{:?},"offset":{},"resolved_offset":{},"drift":{},"supported":{}}}"#,
-                p.label, p.image_offset, resolved, p.drift(), p.supported
+                p.label,
+                p.image_offset,
+                resolved,
+                p.drift(),
+                p.supported
             )
         })
         .collect();

@@ -5,7 +5,9 @@ use fpui_wasm::WasmPlugin;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let wasm = args.next().expect("usage: run_plugin <plugin.wasm> [hook] [payload]");
+    let wasm = args
+        .next()
+        .expect("usage: run_plugin <plugin.wasm> [hook] [payload]");
     let hook = args.next().unwrap_or_else(|| "message".to_string());
     let payload = args.next().unwrap_or_else(|| "hello from fpui".to_string());
 

@@ -47,7 +47,9 @@
 //! `simd` support, which QuickJS-wasm needs).
 
 use fpui_host::Plugin;
-use wasmi::{Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc};
+use wasmi::{
+    Config, Engine, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder, TypedFunc,
+};
 
 #[cfg(feature = "js")]
 mod javy;
@@ -118,7 +120,9 @@ impl WasmPlugin {
         config.consume_fuel(true);
         let engine = Engine::new(&config);
         let module = Module::new(&engine, wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
-        let limits = StoreLimitsBuilder::new().memory_size(MAX_MEMORY_BYTES).build();
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(MAX_MEMORY_BYTES)
+            .build();
         let mut store = Store::new(&engine, limits);
         // Cap linear memory before instantiation, which is where the module's
         // declared memory is reserved: an over-large request is denied here
@@ -136,7 +140,9 @@ impl WasmPlugin {
             .ok_or(WasmError::MissingExport("memory"))?;
         // alloc pairs with either hook. A plugin that implements neither hook is
         // inert but still valid.
-        let alloc = instance.get_typed_func::<i32, i32>(&store, "fpui_alloc").ok();
+        let alloc = instance
+            .get_typed_func::<i32, i32>(&store, "fpui_alloc")
+            .ok();
         let transform = instance
             .get_typed_func::<(i32, i32, i32, i32), i64>(&store, "fpui_transform")
             .ok();
@@ -162,7 +168,9 @@ impl WasmPlugin {
         if ptr < 0 {
             return None;
         }
-        self.memory.write(&mut self.store, ptr as usize, bytes).ok()?;
+        self.memory
+            .write(&mut self.store, ptr as usize, bytes)
+            .ok()?;
         Some((ptr, len))
     }
 
@@ -214,7 +222,8 @@ impl WasmPlugin {
         self.store.set_fuel(self.fuel_per_call).ok()?;
         let (hook_ptr, hook_len) = self.write_bytes(alloc, hook.as_bytes())?;
         let (in_ptr, in_len) = self.write_bytes(alloc, payload)?;
-        func.call(&mut self.store, (hook_ptr, hook_len, in_ptr, in_len)).ok()?;
+        func.call(&mut self.store, (hook_ptr, hook_len, in_ptr, in_len))
+            .ok()?;
         Some(())
     }
 }
@@ -348,7 +357,8 @@ mod tests {
         let wasm = wat::parse_str(UPPERCASE_WAT).unwrap();
         let plugin = WasmPlugin::load(&wasm).unwrap();
         let mut host = Host::new();
-        host.register(&manifest(&[content()]), &[content()], Box::new(plugin)).unwrap();
+        host.register(&manifest(&[content()]), &[content()], Box::new(plugin))
+            .unwrap();
         let out = host.transform(&content(), "message", b"ship it");
         assert_eq!(String::from_utf8(out).unwrap(), "SHIP IT");
     }
@@ -359,7 +369,8 @@ mod tests {
         let plugin = WasmPlugin::load(&wasm).unwrap();
         let mut host = Host::new();
         // Granted only `events`, so a transform under `content` never runs.
-        host.register(&manifest(&[events()]), &[events()], Box::new(plugin)).unwrap();
+        host.register(&manifest(&[events()]), &[events()], Box::new(plugin))
+            .unwrap();
         let out = host.transform(&content(), "message", b"ship it");
         assert_eq!(String::from_utf8(out).unwrap(), "ship it");
     }
@@ -374,7 +385,10 @@ mod tests {
 
     #[test]
     fn a_non_module_is_rejected() {
-        assert!(matches!(WasmPlugin::load(b"not wasm"), Err(WasmError::Compile(_))));
+        assert!(matches!(
+            WasmPlugin::load(b"not wasm"),
+            Err(WasmError::Compile(_))
+        ));
     }
 
     // Declares a ~3 GiB initial linear memory (50000 pages × 64 KiB). Valid wasm,
@@ -390,7 +404,10 @@ mod tests {
         let wasm = wat::parse_str(HUGE_MEMORY_WAT).unwrap();
         // The limiter denies the initial reservation, so instantiation fails
         // instead of the host trying to back ~3 GiB of guest memory.
-        assert!(matches!(WasmPlugin::load(&wasm), Err(WasmError::Instantiate(_))));
+        assert!(matches!(
+            WasmPlugin::load(&wasm),
+            Err(WasmError::Instantiate(_))
+        ));
     }
 
     #[test]
@@ -409,7 +426,8 @@ mod tests {
         let wasm = wat::parse_str(OBSERVE_WAT).unwrap();
         let plugin = WasmPlugin::load(&wasm).unwrap();
         let mut host = Host::new();
-        host.register(&manifest(&[events()]), &[events()], Box::new(plugin)).unwrap();
+        host.register(&manifest(&[events()]), &[events()], Box::new(plugin))
+            .unwrap();
         host.observe(&events(), "ready", b"hi"); // Events-gated path delivers without panic.
         assert_eq!(host.len(), 1);
     }

@@ -231,7 +231,9 @@ mod tests {
         m.capabilities = vec![Capability::new("storage"), Capability::new("storage")];
         assert_eq!(
             m.validate(),
-            Err(ManifestError::DuplicateCapability(Capability::new("storage")))
+            Err(ManifestError::DuplicateCapability(Capability::new(
+                "storage"
+            )))
         );
     }
 

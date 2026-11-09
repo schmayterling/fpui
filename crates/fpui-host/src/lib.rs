@@ -101,7 +101,10 @@ impl core::fmt::Display for HostError {
             Self::Manifest(e) => write!(f, "{e}"),
             Self::NotAPlugin => write!(f, "only a plugin may be registered with a host"),
             Self::UngrantedCapability(cap) => {
-                write!(f, "granted capability `{cap}` was not requested by the manifest")
+                write!(
+                    f,
+                    "granted capability `{cap}` was not requested by the manifest"
+                )
             }
             Self::DuplicateId(id) => write!(f, "a plugin with id `{id}` is already registered"),
         }
@@ -252,9 +255,16 @@ mod tests {
     #[test]
     fn a_granted_transform_runs() {
         let mut host = Host::new();
-        host.register(&manifest("up", &[content()]), &[content()], Box::new(Spy::default()))
-            .unwrap();
-        assert_eq!(run(&mut host, &content(), "message", "hi there"), "HI THERE");
+        host.register(
+            &manifest("up", &[content()]),
+            &[content()],
+            Box::new(Spy::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            run(&mut host, &content(), "message", "hi there"),
+            "HI THERE"
+        );
     }
 
     #[test]
@@ -268,7 +278,10 @@ mod tests {
             Box::new(Spy::default()),
         )
         .unwrap();
-        assert_eq!(run(&mut host, &content(), "message", "hi there"), "hi there");
+        assert_eq!(
+            run(&mut host, &content(), "message", "hi there"),
+            "hi there"
+        );
     }
 
     #[test]
@@ -283,10 +296,18 @@ mod tests {
             }
         }
         let mut host = Host::new();
-        host.register(&manifest("a", &[content()]), &[content()], Box::new(Wrap("(", ")")))
-            .unwrap();
-        host.register(&manifest("b", &[content()]), &[content()], Box::new(Wrap("[", "]")))
-            .unwrap();
+        host.register(
+            &manifest("a", &[content()]),
+            &[content()],
+            Box::new(Wrap("(", ")")),
+        )
+        .unwrap();
+        host.register(
+            &manifest("b", &[content()]),
+            &[content()],
+            Box::new(Wrap("[", "]")),
+        )
+        .unwrap();
         // a wraps first, then b wraps a's output.
         assert_eq!(run(&mut host, &content(), "message", "mid"), "[(mid)]");
     }
@@ -316,7 +337,11 @@ mod tests {
     fn rejects_granting_a_capability_the_manifest_didnt_ask_for() {
         let mut host = Host::new();
         let err = host
-            .register(&manifest("p", &[content()]), &[events()], Box::new(Spy::default()))
+            .register(
+                &manifest("p", &[content()]),
+                &[events()],
+                Box::new(Spy::default()),
+            )
             .unwrap_err();
         assert_eq!(err, HostError::UngrantedCapability(events()));
     }
@@ -324,10 +349,18 @@ mod tests {
     #[test]
     fn rejects_a_duplicate_id() {
         let mut host = Host::new();
-        host.register(&manifest("dup", &[content()]), &[content()], Box::new(Spy::default()))
-            .unwrap();
+        host.register(
+            &manifest("dup", &[content()]),
+            &[content()],
+            Box::new(Spy::default()),
+        )
+        .unwrap();
         let err = host
-            .register(&manifest("dup", &[content()]), &[content()], Box::new(Spy::default()))
+            .register(
+                &manifest("dup", &[content()]),
+                &[content()],
+                Box::new(Spy::default()),
+            )
             .unwrap_err();
         assert_eq!(err, HostError::DuplicateId("dup".into()));
     }

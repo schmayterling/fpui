@@ -67,10 +67,15 @@ impl core::fmt::Display for AnchorError {
         match self {
             Self::Parse(e) => write!(f, "not a 64-bit Mach-O: {e}"),
             Self::StringMissing => write!(f, "string not found in any read-only section"),
-            Self::StringAmbiguous(n) => write!(f, "string occurs {n} times; its address is ambiguous"),
+            Self::StringAmbiguous(n) => {
+                write!(f, "string occurs {n} times; its address is ambiguous")
+            }
             Self::NoReference => write!(f, "no adrp+add pair forms the string's address"),
             Self::ReferenceAmbiguous(n) => {
-                write!(f, "string is referenced from {n} functions; use a more specific string")
+                write!(
+                    f,
+                    "string is referenced from {n} functions; use a more specific string"
+                )
             }
             Self::NoFunctionStarts => write!(f, "build has no LC_FUNCTION_STARTS"),
             Self::NoText => write!(f, "build has no __text section"),
@@ -189,7 +194,9 @@ pub fn resolve_anchors(
     // reference wins; the panic-`Location` indirection is consulted only when the
     // string is referenced nowhere directly, so existing anchors never change.
     for (i, vmaddr) in slot_vmaddr.into_iter().enumerate() {
-        let Some(string_vmaddr) = vmaddr else { continue };
+        let Some(string_vmaddr) = vmaddr else {
+            continue;
+        };
         let (hits, xref) = if funcs[i].is_empty() {
             (&loc_funcs[i], loc_first_xref[i])
         } else {
@@ -374,7 +381,11 @@ fn decode_add_imm(word: u32) -> Option<(u32, u32, u64)> {
     let imm12 = (word >> 10) & 0xFFF;
     let rn = (word >> 5) & 0x1F;
     let rd = word & 0x1F;
-    let value = if sh == 1 { (imm12 as u64) << 12 } else { imm12 as u64 };
+    let value = if sh == 1 {
+        (imm12 as u64) << 12
+    } else {
+        imm12 as u64
+    };
     Some((rd, rn, value))
 }
 

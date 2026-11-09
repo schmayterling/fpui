@@ -109,7 +109,10 @@ fn main() -> ExitCode {
                 images.len()
             );
             let replacement = match force_return {
-                Some(v) => format!(r#","replacement_bytes":"{}""#, hex(&force_return_aarch64(v))),
+                Some(v) => format!(
+                    r#","replacement_bytes":"{}""#,
+                    hex(&force_return_aarch64(v))
+                ),
                 None => String::new(),
             };
             println!(
@@ -149,7 +152,8 @@ fn site_offset(image: &[u8], args: &[String]) -> Result<u64, String> {
         );
         return Ok(anchor.func_offset);
     }
-    let name = flag(args, "--symbol").ok_or("need --symbol <name>, --offset <n>, or --anchor <s>")?;
+    let name =
+        flag(args, "--symbol").ok_or("need --symbol <name>, --offset <n>, or --anchor <s>")?;
     let file = object::File::parse(image).map_err(|e| format!("parse object: {e}"))?;
     symbol_file_offset(&file, name)
         .ok_or_else(|| format!("symbol `{name}` not found (is this build stripped?)"))
@@ -158,10 +162,10 @@ fn site_offset(image: &[u8], args: &[String]) -> Result<u64, String> {
 /// The file offset of a named symbol: find the symbol's address, then the
 /// section that holds it, and map the address through that section's file range.
 fn symbol_file_offset(file: &object::File, name: &str) -> Option<u64> {
-    let sym = file
-        .symbols()
-        .chain(file.dynamic_symbols())
-        .find(|s| s.name().is_ok_and(|n| n == name || n.trim_start_matches('_') == name))?;
+    let sym = file.symbols().chain(file.dynamic_symbols()).find(|s| {
+        s.name()
+            .is_ok_and(|n| n == name || n.trim_start_matches('_') == name)
+    })?;
     let addr = sym.address();
     let section = file.sections().find(|s| {
         let base = s.address();

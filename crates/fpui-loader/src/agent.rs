@@ -199,11 +199,13 @@ mod frida_backend {
 
     use std::sync::mpsc::Sender;
 
-    use frida_gum::interceptor::{InvocationContext, InvocationListener, Interceptor, ProbeListener};
-    use frida_gum::{Gum, NativePointer};
     use fpui_target::{
         ArgOp, ElementFixup, ReplaceOp, ReturnOp, StringArg, TargetAdapter, ValueLocation,
     };
+    use frida_gum::interceptor::{
+        Interceptor, InvocationContext, InvocationListener, ProbeListener,
+    };
+    use frida_gum::{Gum, NativePointer};
 
     use crate::{EncodedColor, PlannedWrite};
 
@@ -213,7 +215,11 @@ mod frida_backend {
         SetReg { reg: usize, value: u64 },
         /// Write `bytes` into memory at `[general_register[base] + offset]` — for
         /// a color that lives in a struct or on the heap, the usual GPUI case.
-        WriteMem { base: usize, offset: i64, bytes: Vec<u8> },
+        WriteMem {
+            base: usize,
+            offset: i64,
+            bytes: Vec<u8>,
+        },
     }
 
     /// A probe tied to one site: when execution reaches the pinned instruction,
@@ -233,7 +239,11 @@ mod frida_backend {
                         debug_assert!(false, "probe cpu context was unexpectedly read-only");
                     }
                 }
-                Action::WriteMem { base, offset, bytes } => {
+                Action::WriteMem {
+                    base,
+                    offset,
+                    bytes,
+                } => {
                     let addr = cpu.reg(*base).wrapping_add_signed(*offset);
                     // SAFETY: `addr` is a live base register the target itself
                     // uses to reach this color, plus a fixed offset from a
@@ -256,7 +266,10 @@ mod frida_backend {
     fn probe_for(write: &PlannedWrite) -> io::Result<ColorProbe> {
         let action = match (write.location, write.color) {
             (ValueLocation::General(n), EncodedColor::U32(word)) if (n as usize) < 29 => {
-                Action::SetReg { reg: n as usize, value: word as u64 }
+                Action::SetReg {
+                    reg: n as usize,
+                    value: word as u64,
+                }
             }
             (ValueLocation::Indirect { base, offset }, color) if (base as usize) < 29 => {
                 Action::WriteMem {
@@ -268,7 +281,10 @@ mod frida_backend {
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    format!("site `{}`: unsupported location or encoding for this backend", write.token),
+                    format!(
+                        "site `{}`: unsupported location or encoding for this backend",
+                        write.token
+                    ),
                 ))
             }
         };
@@ -288,7 +304,9 @@ mod frida_backend {
             let address = NativePointer(write.runtime_addr as *mut core::ffi::c_void);
             interceptor
                 .attach_instruction(address, probe)
-                .map_err(|e| io::Error::other(format!("attach at {:#x}: {e:?}", write.runtime_addr)))?;
+                .map_err(|e| {
+                    io::Error::other(format!("attach at {:#x}: {e:?}", write.runtime_addr))
+                })?;
         }
         // Keep gum and the interceptor alive for the process lifetime too.
         Box::leak(Box::new((gum, interceptor)));
@@ -321,7 +339,9 @@ mod frida_backend {
                 strings.push(String::from_utf8_lossy(bytes).into_owned());
             }
             let payload = serde_json::to_vec(&strings).unwrap_or_default();
-            let _ = self.tx.send((self.hook.clone(), self.capability.clone(), payload));
+            let _ = self
+                .tx
+                .send((self.hook.clone(), self.capability.clone(), payload));
         }
     }
 
@@ -352,9 +372,9 @@ mod frida_backend {
                 tx: tx.clone(),
             }));
             let np = NativePointer(addr as *mut core::ffi::c_void);
-            interceptor.attach_instruction(np, probe).map_err(|e| {
-                io::Error::other(format!("attach event at {addr:#x}: {e:?}"))
-            })?;
+            interceptor
+                .attach_instruction(np, probe)
+                .map_err(|e| io::Error::other(format!("attach event at {addr:#x}: {e:?}")))?;
         }
         Box::leak(Box::new((gum, interceptor)));
         Ok(())
@@ -388,9 +408,8 @@ mod frida_backend {
         for site in &adapter.returns {
             let addr = site.runtime_addr(image_base);
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
-            let actual = unsafe {
-                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
-            };
+            let actual =
+                unsafe { std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len()) };
             if actual != site.expected_bytes.as_slice() {
                 eprintln!(
                     "fpui: skipping return site `{}` at {addr:#x}; pinned bytes moved",
@@ -434,9 +453,8 @@ mod frida_backend {
         for site in &adapter.args {
             let addr = site.runtime_addr(image_base);
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
-            let actual = unsafe {
-                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
-            };
+            let actual =
+                unsafe { std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len()) };
             if actual != site.expected_bytes.as_slice() {
                 eprintln!(
                     "fpui: skipping arg site `{}` at {addr:#x}; pinned bytes moved",
@@ -444,7 +462,10 @@ mod frida_backend {
                 );
                 continue;
             }
-            let probe = Box::leak(Box::new(ArgProbe { arg: site.arg as u32, op: site.op }));
+            let probe = Box::leak(Box::new(ArgProbe {
+                arg: site.arg as u32,
+                op: site.op,
+            }));
             let np = NativePointer(addr as *mut core::ffi::c_void);
             interceptor
                 .attach(np, probe)
@@ -491,9 +512,8 @@ mod frida_backend {
         for site in &adapter.replaces {
             let addr = site.runtime_addr(image_base);
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
-            let actual = unsafe {
-                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
-            };
+            let actual =
+                unsafe { std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len()) };
             if actual != site.expected_bytes.as_slice() {
                 eprintln!(
                     "fpui: skipping replace site `{}` at {addr:#x}; pinned bytes moved",
@@ -595,7 +615,11 @@ mod frida_backend {
             }
             // Write our element at index `n`, then fill its pointer fields.
             let slot_elem = newptr + n * elem;
-            std::ptr::copy_nonoverlapping(self.element.as_ptr(), slot_elem as *mut u8, elem as usize);
+            std::ptr::copy_nonoverlapping(
+                self.element.as_ptr(),
+                slot_elem as *mut u8,
+                elem as usize,
+            );
             for fx in &self.fixups {
                 *((slot_elem + fx.offset) as *mut u64) = fx.value;
             }
@@ -628,7 +652,9 @@ mod frida_backend {
             *((base + 16) as *const u64),
         ];
         let ptr = w[ptr_word];
-        let others_match = (0..3).filter(|&i| i != ptr_word).all(|i| w[i] == expected_len);
+        let others_match = (0..3)
+            .filter(|&i| i != ptr_word)
+            .all(|i| w[i] == expected_len);
         (ptr > 0x1_0000 && (ptr & 7) == 0 && others_match).then_some(ptr)
     }
 
@@ -646,11 +672,17 @@ mod frida_backend {
                 ElementFixup::StaticBlob { offset, bytes } => {
                     // Leaked for the process lifetime; the element points at it.
                     let leaked: &'static [u8] = Box::leak(bytes.clone().into_boxed_slice());
-                    ResolvedFixup { offset: *offset, value: leaked.as_ptr() as u64 }
+                    ResolvedFixup {
+                        offset: *offset,
+                        value: leaked.as_ptr() as u64,
+                    }
                 }
                 ElementFixup::TargetFn { offset, anchor } => {
                     let hit = crate::anchor::resolve_anchor(image, &anchor.text).ok()?;
-                    ResolvedFixup { offset: *offset, value: image_base.wrapping_add(hit.func_offset) }
+                    ResolvedFixup {
+                        offset: *offset,
+                        value: image_base.wrapping_add(hit.func_offset),
+                    }
                 }
                 _ => return None,
             };
@@ -671,9 +703,8 @@ mod frida_backend {
         for site in &adapter.appends {
             let addr = site.runtime_addr(image_base);
             // SAFETY: read-only check of the pinned bytes at the resolved entry.
-            let actual = unsafe {
-                std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len())
-            };
+            let actual =
+                unsafe { std::slice::from_raw_parts(addr as *const u8, site.expected_bytes.len()) };
             if actual != site.expected_bytes.as_slice() {
                 eprintln!(
                     "fpui: skipping list-append `{}` at {addr:#x}; pinned bytes moved",
@@ -793,7 +824,9 @@ mod frida_backend {
                 VM_PROT_READ | VM_PROT_EXECUTE,
             );
             if kr != 0 {
-                return Err(io::Error::other(format!("vm_protect restore failed: kr={kr}")));
+                return Err(io::Error::other(format!(
+                    "vm_protect restore failed: kr={kr}"
+                )));
             }
         }
         Ok(())
@@ -884,7 +917,9 @@ pub fn main_image_base() -> Option<u64> {
         // SAFETY: `data` is the `&mut u64` we passed below; store the first
         // object's load bias and stop the walk by returning non-zero.
         #[allow(clippy::unnecessary_cast, reason = "32/64 bit systems")]
-        unsafe { *(data as *mut u64) = (*info).dlpi_addr as u64 };
+        unsafe {
+            *(data as *mut u64) = (*info).dlpi_addr as u64
+        };
         1
     }
     let mut base: u64 = 0;
@@ -917,8 +952,9 @@ pub fn run() -> io::Result<()> {
     let adapter = adapter_from_env()?;
     let package = theme_from_env()?;
     let variant = pick_variant(&package)?;
-    let base = main_image_base()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "main executable image not found"))?;
+    let base = main_image_base().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "main executable image not found")
+    })?;
     // Resolve each site to where it actually sits in this build before planning,
     // so a drifted version still patches. We read the target's own file from disk
     // (its on-disk layout matches the loaded image) and scan for each site's
@@ -929,12 +965,15 @@ pub fn run() -> io::Result<()> {
     // point — anchors/signatures re-resolve and every site is byte-checked live),
     // but it is reported, and we never fall back to un-resolved pinned offsets
     // against an image we couldn't read.
-    let image = std::env::current_exe().and_then(std::fs::read).map_err(|e| {
-        io::Error::new(
+    let image =
+        std::env::current_exe()
+            .and_then(std::fs::read)
+            .map_err(|e| {
+                io::Error::new(
             e.kind(),
             format!("cannot read own image for the identity check; refusing to patch blind: {e}"),
         )
-    })?;
+            })?;
     if let Err(e) = adapter.identity.verify_file(&image) {
         eprintln!(
             "fpui: target is not the exact pinned build ({e}); relying on anchor/signature \
@@ -1104,7 +1143,10 @@ mod tests {
                 light: Some(variant.clone()),
             },
         };
-        assert_eq!(pick_variant(&light_only).unwrap().get("sidebar"), Some(Rgba::rgb(1, 2, 3)));
+        assert_eq!(
+            pick_variant(&light_only).unwrap().get("sidebar"),
+            Some(Rgba::rgb(1, 2, 3))
+        );
     }
 
     #[test]

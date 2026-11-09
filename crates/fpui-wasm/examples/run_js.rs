@@ -11,7 +11,9 @@ use fpui_wasm::JavyPlugin;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let wasm = args.next().expect("usage: run_js <plugin.wasm> [payload] [hook]");
+    let wasm = args
+        .next()
+        .expect("usage: run_js <plugin.wasm> [payload] [hook]");
     let payload = args.next().unwrap_or_else(|| "hello".to_string());
     let hook = args.next().unwrap_or_else(|| "message".to_string());
 
