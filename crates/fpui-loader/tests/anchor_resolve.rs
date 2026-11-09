@@ -48,6 +48,8 @@ fn adapter(returns: Vec<ReturnSite>) -> TargetAdapter {
         replaces: vec![],
         patches: vec![],
         appends: vec![],
+        paints: vec![],
+        elements: vec![],
     }
 }
 
