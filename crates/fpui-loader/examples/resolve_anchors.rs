@@ -9,7 +9,9 @@ use std::time::Instant;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let binary = args.next().expect("usage: resolve_anchors <binary> <string>...");
+    let binary = args
+        .next()
+        .expect("usage: resolve_anchors <binary> <string>...");
     let needles: Vec<String> = args.collect();
     assert!(!needles.is_empty(), "give at least one string to anchor");
     let refs: Vec<&str> = needles.iter().map(String::as_str).collect();

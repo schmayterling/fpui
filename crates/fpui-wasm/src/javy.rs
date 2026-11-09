@@ -64,7 +64,10 @@
 use std::sync::Arc;
 
 use fpui_host::Plugin;
-use wasmi::{Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmi::{
+    Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store, StoreLimits,
+    StoreLimitsBuilder,
+};
 
 use crate::{WasmError, MAX_MEMORY_BYTES, MAX_OUTPUT};
 
@@ -105,8 +108,16 @@ struct JavyCtx {
 
 impl JavyCtx {
     fn new(payload: &[u8]) -> Self {
-        let limits = StoreLimitsBuilder::new().memory_size(MAX_MEMORY_BYTES).build();
-        Self { limits, stdin: payload.to_vec(), stdin_pos: 0, stdout: Vec::new(), output_overflow: false }
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(MAX_MEMORY_BYTES)
+            .build();
+        Self {
+            limits,
+            stdin: payload.to_vec(),
+            stdin_pos: 0,
+            stdout: Vec::new(),
+            output_overflow: false,
+        }
     }
 }
 
@@ -141,7 +152,12 @@ impl JavyPlugin {
         let module = Module::new(&engine, wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
         let mut linker = Linker::new(&engine);
         define_wasi(&mut linker).map_err(|e| WasmError::Instantiate(e.to_string()))?;
-        Ok(Self { engine, module, linker, fuel_per_call })
+        Ok(Self {
+            engine,
+            module,
+            linker,
+            fuel_per_call,
+        })
     }
 
     /// Run the module once for `hook` over `payload`: fresh store seeded with the
@@ -156,7 +172,10 @@ impl JavyPlugin {
         // One budget covers instantiation and the whole `_start` run.
         store.set_fuel(self.fuel_per_call).ok()?;
 
-        let instance = self.linker.instantiate_and_start(&mut store, &self.module).ok()?;
+        let instance = self
+            .linker
+            .instantiate_and_start(&mut store, &self.module)
+            .ok()?;
         let start = instance.get_typed_func::<(), ()>(&store, "_start").ok()?;
 
         // A WASI command ends by calling `proc_exit`, which the shim turns into
@@ -232,16 +251,25 @@ impl JavyRuntime {
         config.consume_fuel(true);
         config.wasm_simd(true).wasm_relaxed_simd(true);
         let engine = Engine::new(&config);
-        let plugin = Module::new(&engine, plugin_wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
+        let plugin =
+            Module::new(&engine, plugin_wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
         let mut wasi = Linker::new(&engine);
         define_wasi(&mut wasi).map_err(|e| WasmError::Instantiate(e.to_string()))?;
-        Ok(Self { shared: Arc::new(SharedEngine { engine, plugin, wasi }), fuel_per_call })
+        Ok(Self {
+            shared: Arc::new(SharedEngine {
+                engine,
+                plugin,
+                wasi,
+            }),
+            fuel_per_call,
+        })
     }
 
     /// Compile a dynamically-linked plugin module (`javy build -C dynamic`)
     /// against this runtime's shared engine.
     pub fn load(&self, module_wasm: &[u8]) -> Result<DynamicJavyPlugin, WasmError> {
-        let module = Module::new(&self.shared.engine, module_wasm).map_err(|e| WasmError::Compile(e.to_string()))?;
+        let module = Module::new(&self.shared.engine, module_wasm)
+            .map_err(|e| WasmError::Compile(e.to_string()))?;
         // The module's imports all name the shared plugin; capture that namespace
         // from the module itself so the exact string (e.g. the versioned
         // "javy-default-plugin-v4") is never hard-coded here.
@@ -251,7 +279,12 @@ impl JavyRuntime {
             .ok_or(WasmError::MissingExport("plugin import"))?
             .module()
             .to_string();
-        Ok(DynamicJavyPlugin { shared: Arc::clone(&self.shared), module, plugin_ns, fuel_per_call: self.fuel_per_call })
+        Ok(DynamicJavyPlugin {
+            shared: Arc::clone(&self.shared),
+            module,
+            plugin_ns,
+            fuel_per_call: self.fuel_per_call,
+        })
     }
 }
 
@@ -280,7 +313,11 @@ impl DynamicJavyPlugin {
         // The shared plugin from `javy emit-plugin` is already pre-initialized, so
         // the host does NOT call `initialize-runtime` — that is the plugin's
         // Wizer pre-init entry, and invoking it on an initialized runtime panics.
-        let plugin = self.shared.wasi.instantiate_and_start(&mut store, &self.shared.plugin).ok()?;
+        let plugin = self
+            .shared
+            .wasi
+            .instantiate_and_start(&mut store, &self.shared.plugin)
+            .ok()?;
 
         // Wire the tiny module's three imports to this engine instance's exports.
         let memory = plugin.get_memory(&store, "memory")?;
@@ -288,10 +325,14 @@ impl DynamicJavyPlugin {
         let invoke = plugin.get_func(&store, "invoke")?;
         let mut linker = Linker::new(&self.shared.engine);
         linker.define(&self.plugin_ns, "memory", memory).ok()?;
-        linker.define(&self.plugin_ns, "cabi_realloc", cabi_realloc).ok()?;
+        linker
+            .define(&self.plugin_ns, "cabi_realloc", cabi_realloc)
+            .ok()?;
         linker.define(&self.plugin_ns, "invoke", invoke).ok()?;
 
-        let instance = linker.instantiate_and_start(&mut store, &self.module).ok()?;
+        let instance = linker
+            .instantiate_and_start(&mut store, &self.module)
+            .ok()?;
         let start = instance.get_typed_func::<(), ()>(&store, "_start").ok()?;
         match start.call(&mut store, ()) {
             Ok(()) => {}
@@ -366,20 +407,29 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
 
     // proc_exit(code): a WASI command's normal way to finish. Turn it into an
     // exit-carrying error so `run` can tell a clean exit from a trap.
-    linker.func_wrap(WASI, "proc_exit", |_c: Caller<JavyCtx>, code: i32| -> Result<(), Error> {
-        Err(Error::i32_exit(code))
-    })?;
+    linker.func_wrap(
+        WASI,
+        "proc_exit",
+        |_c: Caller<JavyCtx>, code: i32| -> Result<(), Error> { Err(Error::i32_exit(code)) },
+    )?;
 
     // fd_read(fd, iovs, iovs_len, nread): only fd 0 (stdin) reads; it drains the
     // payload buffer into the iovecs. Every other fd is denied.
     linker.func_wrap(
         WASI,
         "fd_read",
-        |mut caller: Caller<JavyCtx>, fd: i32, iovs: i32, iovs_len: i32, nread: i32| -> Result<i32, Error> {
+        |mut caller: Caller<JavyCtx>,
+         fd: i32,
+         iovs: i32,
+         iovs_len: i32,
+         nread: i32|
+         -> Result<i32, Error> {
             if fd != FD_STDIN {
                 return Ok(ERRNO_BADF);
             }
-            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let Some(mem) = guest_memory(&caller) else {
+                return Ok(ERRNO_BADF);
+            };
             let (data, ctx) = mem.data_and_store_mut(&mut caller);
             let mut total: u32 = 0;
             for i in 0..(iovs_len as usize) {
@@ -415,11 +465,18 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
     linker.func_wrap(
         WASI,
         "fd_write",
-        |mut caller: Caller<JavyCtx>, fd: i32, iovs: i32, iovs_len: i32, nwritten: i32| -> Result<i32, Error> {
+        |mut caller: Caller<JavyCtx>,
+         fd: i32,
+         iovs: i32,
+         iovs_len: i32,
+         nwritten: i32|
+         -> Result<i32, Error> {
             if fd != FD_STDOUT && fd != FD_STDERR {
                 return Ok(ERRNO_BADF);
             }
-            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let Some(mem) = guest_memory(&caller) else {
+                return Ok(ERRNO_BADF);
+            };
             let (data, ctx) = mem.data_and_store_mut(&mut caller);
             let mut total: u32 = 0;
             for i in 0..(iovs_len as usize) {
@@ -428,7 +485,9 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
                     return Ok(ERRNO_BADF);
                 };
                 let (start, end) = (ptr as usize, (ptr as usize).saturating_add(len as usize));
-                let Some(chunk) = data.get(start..end) else { return Ok(ERRNO_BADF) };
+                let Some(chunk) = data.get(start..end) else {
+                    return Ok(ERRNO_BADF);
+                };
                 if fd == FD_STDOUT {
                     let room = MAX_OUTPUT.saturating_sub(ctx.stdout.len());
                     if chunk.len() > room {
@@ -457,9 +516,11 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
     )?;
 
     // fd_close: nothing to close; report success for any fd.
-    linker.func_wrap(WASI, "fd_close", |_c: Caller<JavyCtx>, _fd: i32| -> Result<i32, Error> {
-        Ok(ERRNO_SUCCESS)
-    })?;
+    linker.func_wrap(
+        WASI,
+        "fd_close",
+        |_c: Caller<JavyCtx>, _fd: i32| -> Result<i32, Error> { Ok(ERRNO_SUCCESS) },
+    )?;
 
     // fd_fdstat_get(fd, buf): report the three standard streams as character
     // devices (24-byte fdstat, filetype in the first byte, the rest zero) so the
@@ -471,10 +532,14 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
             if fd != FD_STDIN && fd != FD_STDOUT && fd != FD_STDERR {
                 return Ok(ERRNO_BADF);
             }
-            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let Some(mem) = guest_memory(&caller) else {
+                return Ok(ERRNO_BADF);
+            };
             let (data, _ctx) = mem.data_and_store_mut(&mut caller);
             let base = buf as usize;
-            let Some(stat) = data.get_mut(base..base.saturating_add(24)) else { return Ok(ERRNO_BADF) };
+            let Some(stat) = data.get_mut(base..base.saturating_add(24)) else {
+                return Ok(ERRNO_BADF);
+            };
             stat.fill(0);
             stat[0] = FILETYPE_CHARACTER_DEVICE;
             Ok(ERRNO_SUCCESS)
@@ -486,9 +551,14 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
         WASI,
         "environ_sizes_get",
         |mut caller: Caller<JavyCtx>, count: i32, size: i32| -> Result<i32, Error> {
-            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let Some(mem) = guest_memory(&caller) else {
+                return Ok(ERRNO_BADF);
+            };
             let (data, _ctx) = mem.data_and_store_mut(&mut caller);
-            match (write_u32(data, count as usize, 0), write_u32(data, size as usize, 0)) {
+            match (
+                write_u32(data, count as usize, 0),
+                write_u32(data, size as usize, 0),
+            ) {
                 (Some(()), Some(())) => Ok(ERRNO_SUCCESS),
                 _ => Ok(ERRNO_BADF),
             }
@@ -508,7 +578,9 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
         WASI,
         "clock_time_get",
         |mut caller: Caller<JavyCtx>, _id: i32, _precision: i64, time: i32| -> Result<i32, Error> {
-            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let Some(mem) = guest_memory(&caller) else {
+                return Ok(ERRNO_BADF);
+            };
             let (data, _ctx) = mem.data_and_store_mut(&mut caller);
             match write_u64(data, time as usize, 0) {
                 Some(()) => Ok(ERRNO_SUCCESS),
@@ -525,7 +597,9 @@ fn define_wasi(linker: &mut Linker<JavyCtx>) -> Result<(), Error> {
         WASI,
         "random_get",
         |mut caller: Caller<JavyCtx>, buf: i32, len: i32| -> Result<i32, Error> {
-            let Some(mem) = guest_memory(&caller) else { return Ok(ERRNO_BADF) };
+            let Some(mem) = guest_memory(&caller) else {
+                return Ok(ERRNO_BADF);
+            };
             let (data, _ctx) = mem.data_and_store_mut(&mut caller);
             let (start, end) = (buf as usize, (buf as usize).saturating_add(len as usize));
             match data.get_mut(start..end) {
@@ -749,7 +823,8 @@ mod tests {
             capabilities: vec![cap.clone()],
         };
         let mut host = Host::new();
-        host.register(&manifest, std::slice::from_ref(&cap), Box::new(plugin)).unwrap();
+        host.register(&manifest, std::slice::from_ref(&cap), Box::new(plugin))
+            .unwrap();
         let out = host.transform(&cap, "message", b"through the host");
         assert_eq!(out, b"THROUGH THE HOST");
     }
@@ -803,7 +878,9 @@ mod tests {
     #[test]
     fn a_dynamic_module_runs_on_the_shared_engine() {
         let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
-        let mut js = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        let mut js = runtime
+            .load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap())
+            .unwrap();
         // The tiny module shares the plugin's memory and calls its `invoke`, which
         // echoes the framed stdin — so the host gets the whole frame back. Proves
         // the shared-engine hosting chain: instantiate the plugin, wire its memory
@@ -816,8 +893,12 @@ mod tests {
     fn the_runtime_hosts_many_modules_from_one_shared_plugin() {
         // The footprint win: one compiled plugin, many tiny modules.
         let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
-        let mut a = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
-        let mut b = runtime.load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap()).unwrap();
+        let mut a = runtime
+            .load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap())
+            .unwrap();
+        let mut b = runtime
+            .load(&wat::parse_str(FAKE_DYN_MODULE_WAT).unwrap())
+            .unwrap();
         assert_eq!(a.transform("x", b"one").unwrap(), frame("x", b"one"));
         assert_eq!(b.transform("y", b"two").unwrap(), frame("y", b"two"));
     }
@@ -825,6 +906,9 @@ mod tests {
     #[test]
     fn the_runtime_rejects_a_non_module() {
         let runtime = JavyRuntime::new(&wat::parse_str(FAKE_PLUGIN_WAT).unwrap()).unwrap();
-        assert!(matches!(runtime.load(b"not wasm"), Err(WasmError::Compile(_))));
+        assert!(matches!(
+            runtime.load(b"not wasm"),
+            Err(WasmError::Compile(_))
+        ));
     }
 }

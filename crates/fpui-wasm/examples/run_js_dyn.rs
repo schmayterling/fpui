@@ -10,13 +10,20 @@ use fpui_wasm::JavyRuntime;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let plugin = args.next().expect("usage: run_js_dyn <plugin.wasm> <module.wasm> [payload] [hook]");
-    let module = args.next().expect("usage: run_js_dyn <plugin.wasm> <module.wasm> [payload] [hook]");
+    let plugin = args
+        .next()
+        .expect("usage: run_js_dyn <plugin.wasm> <module.wasm> [payload] [hook]");
+    let module = args
+        .next()
+        .expect("usage: run_js_dyn <plugin.wasm> <module.wasm> [payload] [hook]");
     let payload = args.next().unwrap_or_else(|| "hello".to_string());
     let hook = args.next().unwrap_or_else(|| "message".to_string());
 
-    let runtime = JavyRuntime::new(&std::fs::read(&plugin).expect("read the shared plugin")).expect("load the plugin");
-    let mut js = runtime.load(&std::fs::read(&module).expect("read the module")).expect("load the module");
+    let runtime = JavyRuntime::new(&std::fs::read(&plugin).expect("read the shared plugin"))
+        .expect("load the plugin");
+    let mut js = runtime
+        .load(&std::fs::read(&module).expect("read the module"))
+        .expect("load the module");
 
     match js.transform(&hook, payload.as_bytes()) {
         Some(out) => println!("{}", String::from_utf8_lossy(&out)),

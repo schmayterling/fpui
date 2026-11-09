@@ -18,9 +18,7 @@
 //! release binary has no stable Rust layout to rely on, so the loader only ever
 //! touches one checked color slot at a fixed spot.
 
-use fpui_target::{
-    ColorEncoding, Signature, TargetAdapter, ValueLocation, VerifyError,
-};
+use fpui_target::{ColorEncoding, Signature, TargetAdapter, ValueLocation, VerifyError};
 use fpui_theme::{Rgba, Variant};
 
 pub mod agent;
@@ -132,7 +130,11 @@ pub struct PlannedWrite {
 /// variant defines a color for it. Tokens the adapter can't paint, or the theme
 /// leaves unset, just aren't in the plan — the loader never pretends to apply a
 /// color it has nowhere to put.
-pub fn plan_writes(adapter: &TargetAdapter, variant: &Variant, image_base: u64) -> Vec<PlannedWrite> {
+pub fn plan_writes(
+    adapter: &TargetAdapter,
+    variant: &Variant,
+    image_base: u64,
+) -> Vec<PlannedWrite> {
     adapter
         .sites
         .iter()
@@ -384,7 +386,6 @@ pub fn force_return_aarch64(value: u16) -> [u8; 8] {
     out
 }
 
-
 /// Rewrite every site and event offset to where it actually sits in `image`,
 /// using each one's signature to recover from drift. Sites that can't be located
 /// are dropped, so planning only ever sees patches that are really present in
@@ -400,7 +401,12 @@ pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter,
     let mut dropped = Vec::new();
     resolve_anchored_entries(&mut resolved, image, &mut dropped);
     resolved.sites.retain_mut(|s| {
-        match locate(image, s.image_offset, &s.expected_bytes, s.signature.as_ref()) {
+        match locate(
+            image,
+            s.image_offset,
+            &s.expected_bytes,
+            s.signature.as_ref(),
+        ) {
             Located::At(off) => {
                 s.image_offset = off;
                 true
@@ -412,7 +418,12 @@ pub fn resolve_adapter(adapter: &TargetAdapter, image: &[u8]) -> (TargetAdapter,
         }
     });
     resolved.events.retain_mut(|e| {
-        match locate(image, e.image_offset, &e.expected_bytes, e.signature.as_ref()) {
+        match locate(
+            image,
+            e.image_offset,
+            &e.expected_bytes,
+            e.signature.as_ref(),
+        ) {
             Located::At(off) => {
                 e.image_offset = off;
                 true
@@ -541,7 +552,12 @@ pub fn check_patches(adapter: &TargetAdapter, build: &[u8]) -> PatchReport {
     let sha256 = fpui_target::sha256(build);
     let mut patches = Vec::with_capacity(adapter.sites.len() + adapter.events.len());
     for site in &adapter.sites {
-        let loc = locate(build, site.image_offset, &site.expected_bytes, site.signature.as_ref());
+        let loc = locate(
+            build,
+            site.image_offset,
+            &site.expected_bytes,
+            site.signature.as_ref(),
+        );
         patches.push(status(site.token.clone(), site.image_offset, loc));
     }
     for event in &adapter.events {
@@ -582,7 +598,12 @@ pub fn apply_byte_patches(adapter: &TargetAdapter, image: &mut [u8]) -> Vec<(Str
         .map(|patch| {
             let fits = patch.replacement_bytes.len() == patch.expected_bytes.len();
             let applied = fits
-                && match locate(image, patch.image_offset, &patch.expected_bytes, patch.signature.as_ref()) {
+                && match locate(
+                    image,
+                    patch.image_offset,
+                    &patch.expected_bytes,
+                    patch.signature.as_ref(),
+                ) {
                     Located::At(off) => {
                         let start = off as usize;
                         image[start..start + patch.replacement_bytes.len()]
@@ -696,7 +717,12 @@ mod tests {
 
     #[test]
     fn alpha_premultiplies_and_packs() {
-        let half_red = Rgba { r: 255, g: 0, b: 0, a: 128 };
+        let half_red = Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 128,
+        };
         let a = 128.0 / 255.0;
         match encode_color(half_red, ColorEncoding::PremultipliedLinearF32) {
             Some(EncodedColor::F32x4([r, g, b, out_a])) => {
@@ -764,7 +790,10 @@ mod tests {
 
     #[test]
     fn preflight_refuses_the_wrong_binary() {
-        let adapter = adapter_with(vec![site("sidebar", 0x10, ColorEncoding::SrgbU32)], b"right");
+        let adapter = adapter_with(
+            vec![site("sidebar", 0x10, ColorEncoding::SrgbU32)],
+            b"right",
+        );
         assert_eq!(preflight(b"right", &adapter), Ok(()));
         assert!(matches!(
             preflight(b"wrong", &adapter),
@@ -826,7 +855,10 @@ mod tests {
         // the pinned bytes two bytes into it, so the real site is 22.
         let mut build = vec![0u8; 64];
         build[20..26].copy_from_slice(&[0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd]);
-        let sig = Signature { bytes: vec![0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd], site_offset: 2 };
+        let sig = Signature {
+            bytes: vec![0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd],
+            site_offset: 2,
+        };
         assert_eq!(at(locate(&build, 8, EXPECT, Some(&sig))), Some(22));
     }
 
@@ -837,7 +869,10 @@ mod tests {
         let win = [0x11, 0x22, 0xaa, 0xbb, 0xcc, 0xdd];
         build[20..26].copy_from_slice(&win);
         build[40..46].copy_from_slice(&win);
-        let sig = Signature { bytes: win.to_vec(), site_offset: 2 };
+        let sig = Signature {
+            bytes: win.to_vec(),
+            site_offset: 2,
+        };
         assert_eq!(at(locate(&build, 8, EXPECT, Some(&sig))), None);
     }
 
@@ -859,7 +894,10 @@ mod tests {
         build[42..46].copy_from_slice(EXPECT); // the real site, two bytes in
         let mut window = vec![0x5a, 0x5b];
         window.extend_from_slice(EXPECT);
-        let sig = Signature { bytes: window, site_offset: 2 };
+        let sig = Signature {
+            bytes: window,
+            site_offset: 2,
+        };
         assert_eq!(at(locate(&build, 8, EXPECT, Some(&sig))), Some(42));
     }
 
@@ -940,7 +978,10 @@ mod tests {
         let mut other = b"xxxxGeneralxxxx".to_vec();
         adapter.patches[0].expected_bytes = b"Special".to_vec();
         adapter.patches[0].replacement_bytes = b"maycord".to_vec();
-        assert_eq!(apply_byte_patches(&adapter, &mut other), vec![("label".to_string(), false)]);
+        assert_eq!(
+            apply_byte_patches(&adapter, &mut other),
+            vec![("label".to_string(), false)]
+        );
         assert_eq!(&other, b"xxxxGeneralxxxx");
     }
 
@@ -952,7 +993,10 @@ mod tests {
         build[60..64].copy_from_slice(EXPECT);
         let mut sidebar = site("sidebar", 8, ColorEncoding::SrgbU32);
         sidebar.expected_bytes = EXPECT.to_vec();
-        sidebar.signature = Some(Signature { bytes: EXPECT.to_vec(), site_offset: 0 });
+        sidebar.signature = Some(Signature {
+            bytes: EXPECT.to_vec(),
+            site_offset: 0,
+        });
         let mut background = site("background", 100, ColorEncoding::SrgbU32);
         background.expected_bytes = EXPECT.to_vec();
         let adapter = adapter_with(vec![sidebar, background], &build);

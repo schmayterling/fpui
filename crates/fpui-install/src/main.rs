@@ -15,8 +15,7 @@
 use std::path::Path;
 use std::process::Command;
 
-const USAGE: &str =
-    "usage: fpui-install wrap <App.app> KEY=VALUE...  |  unwrap <App.app> KEY...";
+const USAGE: &str = "usage: fpui-install wrap <App.app> KEY=VALUE...  |  unwrap <App.app> KEY...";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -35,14 +34,19 @@ fn run_wrap(args: &[String]) -> Result<(), String> {
     let app = Path::new(args.first().ok_or(USAGE)?);
     let mut vars = Vec::new();
     for pair in &args[1..] {
-        let (k, v) = pair.split_once('=').ok_or(format!("expected KEY=VALUE, got `{pair}`"))?;
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or(format!("expected KEY=VALUE, got `{pair}`"))?;
         vars.push((k.to_string(), v.to_string()));
     }
     if vars.is_empty() {
         return Err("wrap needs at least one KEY=VALUE (e.g. DYLD_INSERT_LIBRARIES=...)".into());
     }
     wrap(app, &vars)?;
-    eprintln!("wrapped {} (open it once to clear the Gatekeeper prompt)", app.display());
+    eprintln!(
+        "wrapped {} (open it once to clear the Gatekeeper prompt)",
+        app.display()
+    );
     Ok(())
 }
 
@@ -63,26 +67,37 @@ fn info_plist(app: &Path) -> std::path::PathBuf {
 
 fn wrap(app: &Path, vars: &[(String, String)]) -> Result<(), String> {
     let path = info_plist(app);
-    let mut value = plist::Value::from_file(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut value =
+        plist::Value::from_file(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     add_env(&mut value, vars)?;
-    value.to_file_xml(&path).map_err(|e| format!("write {}: {e}", path.display()))?;
+    value
+        .to_file_xml(&path)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     resign(app)
 }
 
 fn unwrap_app(app: &Path, keys: &[String]) -> Result<(), String> {
     let path = info_plist(app);
-    let mut value = plist::Value::from_file(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut value =
+        plist::Value::from_file(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     remove_env(&mut value, keys)?;
-    value.to_file_xml(&path).map_err(|e| format!("write {}: {e}", path.display()))?;
+    value
+        .to_file_xml(&path)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     resign(app)
 }
 
 /// Add each `KEY=VALUE` to the plist's `LSEnvironment` dictionary, creating it
 /// if absent.
 fn add_env(value: &mut plist::Value, vars: &[(String, String)]) -> Result<(), String> {
-    let dict = value.as_dictionary_mut().ok_or("Info.plist is not a dictionary")?;
+    let dict = value
+        .as_dictionary_mut()
+        .ok_or("Info.plist is not a dictionary")?;
     if !dict.contains_key("LSEnvironment") {
-        dict.insert("LSEnvironment".into(), plist::Value::Dictionary(plist::Dictionary::new()));
+        dict.insert(
+            "LSEnvironment".into(),
+            plist::Value::Dictionary(plist::Dictionary::new()),
+        );
     }
     let env = dict
         .get_mut("LSEnvironment")
@@ -97,8 +112,13 @@ fn add_env(value: &mut plist::Value, vars: &[(String, String)]) -> Result<(), St
 /// Remove each key from `LSEnvironment`, and drop `LSEnvironment` itself if it
 /// ends up empty, restoring the plist to its original shape.
 fn remove_env(value: &mut plist::Value, keys: &[String]) -> Result<(), String> {
-    let dict = value.as_dictionary_mut().ok_or("Info.plist is not a dictionary")?;
-    if let Some(env) = dict.get_mut("LSEnvironment").and_then(|v| v.as_dictionary_mut()) {
+    let dict = value
+        .as_dictionary_mut()
+        .ok_or("Info.plist is not a dictionary")?;
+    if let Some(env) = dict
+        .get_mut("LSEnvironment")
+        .and_then(|v| v.as_dictionary_mut())
+    {
         for k in keys {
             env.remove(k);
         }
@@ -133,7 +153,10 @@ mod tests {
 
     fn app_plist() -> plist::Value {
         let mut d = plist::Dictionary::new();
-        d.insert("CFBundleExecutable".into(), plist::Value::String("App".into()));
+        d.insert(
+            "CFBundleExecutable".into(),
+            plist::Value::String("App".into()),
+        );
         plist::Value::Dictionary(d)
     }
 
@@ -145,12 +168,20 @@ mod tests {
             &[("DYLD_INSERT_LIBRARIES".into(), "/x/agent.dylib".into())],
         )
         .unwrap();
-        let env = v.as_dictionary().unwrap()["LSEnvironment"].as_dictionary().unwrap();
-        assert_eq!(env["DYLD_INSERT_LIBRARIES"].as_string().unwrap(), "/x/agent.dylib");
+        let env = v.as_dictionary().unwrap()["LSEnvironment"]
+            .as_dictionary()
+            .unwrap();
+        assert_eq!(
+            env["DYLD_INSERT_LIBRARIES"].as_string().unwrap(),
+            "/x/agent.dylib"
+        );
 
         remove_env(&mut v, &["DYLD_INSERT_LIBRARIES".into()]).unwrap();
         // Emptied LSEnvironment is dropped, so the plist matches where it started.
         assert!(v.as_dictionary().unwrap().get("LSEnvironment").is_none());
-        assert!(v.as_dictionary().unwrap().contains_key("CFBundleExecutable"));
+        assert!(v
+            .as_dictionary()
+            .unwrap()
+            .contains_key("CFBundleExecutable"));
     }
 }

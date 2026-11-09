@@ -63,7 +63,9 @@ fn resolve_adapter_rewrites_an_anchored_replace_site() {
         expected_bytes: vec![0x00, 0x00, 0x00, 0x90],
         op: ReplaceOp::ReturnConst { value: 0 },
         signature: None,
-        anchor: Some(StringAnchor { text: SENTINEL.into() }),
+        anchor: Some(StringAnchor {
+            text: SENTINEL.into(),
+        }),
     }];
 
     let (resolved, dropped) = resolve_adapter(&a, IMAGE);
@@ -80,7 +82,11 @@ fn resolve_adapter_rewrites_an_anchored_entry_and_drops_an_unresolvable_one() {
     // (must be dropped), one with no anchor (must be left exactly as-is).
     let a = adapter(vec![
         ret("good", 0xDEAD, Some(SENTINEL)),
-        ret("missing", 0x1000, Some("string_that_is_not_in_this_binary_zzz")),
+        ret(
+            "missing",
+            0x1000,
+            Some("string_that_is_not_in_this_binary_zzz"),
+        ),
         ret("plain", 0x2000, None),
     ]);
 
@@ -96,7 +102,10 @@ fn resolve_adapter_rewrites_an_anchored_entry_and_drops_an_unresolvable_one() {
     // The anchored site was re-pointed from its bogus hint to the real entry,
     // which `nm`/`otool` and the anchor API independently agree sits at 0x460.
     let good = &resolved.returns[0];
-    assert_ne!(good.image_offset, 0xDEAD, "the bogus hint must be overwritten");
+    assert_ne!(
+        good.image_offset, 0xDEAD,
+        "the bogus hint must be overwritten"
+    );
     assert_eq!(good.image_offset, TARGET_FILE_OFFSET);
     assert_eq!(
         good.image_offset,
